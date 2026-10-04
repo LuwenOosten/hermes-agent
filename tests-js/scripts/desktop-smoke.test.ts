@@ -148,6 +148,39 @@ test.runIf(process.platform === 'linux')('origin proof finds the live child list
   } finally { child.kill(); await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) }) }
 })
 
+test.runIf(process.platform === 'linux' || process.platform === 'darwin')('a shared host listener is proven by this home ledger, not Electron ancestry', async (): Promise<void> => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-host-listener-'))
+  const child = spawn(process.execPath, ['-e', 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>console.log(s.address().port))'], { stdio: ['ignore', 'pipe', 'pipe'] })
+  try {
+    const port = await new Promise<number>((resolve, reject): void => {
+      child.once('error', reject)
+      child.stdout.once('data', (data: Buffer): void => resolve(Number(data.toString().trim())))
+    })
+    // A reused host backend is not a descendant of the newly opened Desktop.
+    // Here the real listener itself is outside that descendant set.
+    const ledger = path.join(home, 'spawn-ledger.json')
+    const record = { pid: child.pid, purpose: 'serve', host: '127.0.0.1', port }
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    for (const invalid of [{ ...record, port: port + 1 }, { ...record, pid: process.pid },
+      { ...record, isolated: true }, { ...record, purpose: 'update' }]) {
+      fs.writeFileSync(ledger, JSON.stringify([invalid]))
+      expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    }
+    fs.writeFileSync(ledger, JSON.stringify([record]))
+    const backend = localBackendProcess(port, child.pid!, home)
+    expect(backend.pid).toBe(child.pid)
+    expect(backend.ownership).toBe('host-ledger')
+    // Registration does not waive the installed-tree provenance check.
+    expect(() => assertBackendOrigin(backend, home, 'bundled')).toThrow('agent-payload')
+    fs.writeFileSync(ledger, 'invalid')
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+  } finally {
+    child.kill()
+    await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) })
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('a backend bound to the tree by environment needs no root in argv', (): void => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-env-origin-'))
 

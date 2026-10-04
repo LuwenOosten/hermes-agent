@@ -4,6 +4,8 @@ import path from 'node:path'
 
 import { z } from 'zod'
 
+import { parseSpawnLedger } from '../../apps/desktop/electron/backend-discovery.ts'
+
 import { within } from '../../tests/install/e2e-assets/smoke-env.mjs'
 
 export interface NativeProcess {
@@ -11,6 +13,7 @@ export interface NativeProcess {
   parentPid: number
   executable: string
   command: string
+  ownership?: 'child' | 'host-ledger'
   sourceRoot?: string
   // The app binds its backend to a tree by environment, not only by argv: the
   // installation root leads PYTHONPATH and VIRTUAL_ENV names the venv. Only the
@@ -140,12 +143,25 @@ function linuxListeningPid(port: number, candidates: NativeProcess[]): number[] 
 }
 
 /** Identify the actual listener, not a healthy helper or a command recorded before spawn. */
-export function localBackendProcess(port: number, electronPid: number): NativeProcess {
+export function localBackendProcess(port: number, electronPid: number, hermesHome?: string): NativeProcess {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new Error('Invalid backend port')
   }
 
-  const children = descendants(readNativeProcesses(), electronPid)
+  const processes = readNativeProcesses()
+  const children = descendants(processes, electronPid)
+  // An update can automatically reopen the app before this smoke starts. The
+  // new window legitimately attaches to that host backend instead of spawning
+  // its own child. Registration is only a candidate: the OS listener and the
+  // caller's existing installed-tree checks must independently agree.
+  let registered: number[] = []
+  if (hermesHome) {
+    try {
+      registered = parseSpawnLedger(fs.readFileSync(path.join(hermesHome, 'spawn-ledger.json'), 'utf8'))
+        .filter(record => record.port === port).map(record => record.pid)
+    } catch { /* Missing/unreadable ledger provides no attachment evidence. */ }
+  }
+  const candidates = processes.filter(candidate => children.includes(candidate) || registered.includes(candidate.pid))
   let pids: number[]
 
   if (process.platform === 'win32') {
@@ -155,16 +171,17 @@ export function localBackendProcess(port: number, electronPid: number): NativePr
     pids = nativeText('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp']).split('\n')
       .filter((line: string): boolean => /^p\d+$/.test(line)).map((line: string): number => Number(line.slice(1)))
   } else {
-    pids = linuxListeningPid(port, children)
+    pids = linuxListeningPid(port, candidates)
   }
 
-  const matches = children.filter((child: NativeProcess): boolean => pids.includes(child.pid))
+  const matches = candidates.filter((child: NativeProcess): boolean => pids.includes(child.pid))
 
   if (matches.length !== 1) {
-    throw new Error(`Expected one Electron-owned backend listener on port ${port}; found ${matches.length}`)
+    throw new Error(`Expected one Desktop-owned or registered host backend listener on port ${port}; found ${matches.length}`)
   }
 
   const backend = matches[0]
+  backend.ownership = children.includes(backend) ? 'child' : 'host-ledger'
 
   if (process.platform === 'linux') {
     backend.executable = fs.readlinkSync(`/proc/${backend.pid}/exe`)
