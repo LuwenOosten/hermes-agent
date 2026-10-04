@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 import { z } from 'zod'
 
-import { parseSpawnLedger } from '../../apps/desktop/electron/backend-discovery.ts'
+import { parseSpawnLedger, SPAWN_LEDGER_FILENAME } from '../../apps/desktop/electron/backend-discovery.ts'
+import { resolveDesktopHermesHome } from '../../apps/desktop/electron/data-paths.mjs'
 import { within } from '../../tests/install/e2e-assets/smoke-env.mjs'
 
 export interface NativeProcess {
@@ -141,6 +143,40 @@ function linuxListeningPid(port: number, candidates: NativeProcess[]): number[] 
   }).map((candidate: NativeProcess): number => candidate.pid)
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** Epoch seconds a live process started (psutil's `create_time` basis), or null when unreadable. */
+function processStartTime(pid: number): number | null {
+  try {
+    if (process.platform === 'linux') {
+      // psutil: boot time + field 22 (starttime, clock ticks), read after the `(comm)` field.
+      const fields = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(')').pop()!.trim().split(/\s+/)
+      const bootTime = Number(/^btime\s+(\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1])
+      const ticks = Number(nativeText('getconf', ['CLK_TCK']))
+
+      return bootTime + Number(fields[19]) / ticks
+    }
+
+    if (process.platform === 'darwin') {
+      // `Sun Oct  4 15:20:01 2026`, local time, whole seconds.
+      const lstart = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='],
+        { encoding: 'utf8', timeout: 30_000, env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+
+      const match = /^\w{3}\s+(\w{3})\s+(\d+)\s+(\d+):(\d+):(\d+)\s+(\d{4})$/.exec(lstart)
+
+      return match ? new Date(Number(match[6]), MONTHS.indexOf(match[1]), Number(match[2]), Number(match[3]),
+        Number(match[4]), Number(match[5])).getTime() / 1000 : null
+    }
+
+    const ms = nativeText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `([DateTimeOffset](Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop).CreationDate).ToUnixTimeMilliseconds()`])
+
+    return /^\d+$/.test(ms) ? Number(ms) / 1000 : null
+  } catch {
+    return null
+  }
+}
+
 /** Identify the actual listener, not a healthy helper or a command recorded before spawn. */
 export function localBackendProcess(port: number, electronPid: number, hermesHome?: string): NativeProcess {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -156,9 +192,27 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   let registered: number[] = []
 
   if (hermesHome) {
+    // The product writes one machine-root ledger for every profile, and the app
+    // reads it at its own resolved root (`main.ts` -> `spawnLedgerPath(HERMES_HOME)`,
+    // where a `<root>/profiles/<name>` home resolves to `<root>`).
+    const ledgerRoot = resolveDesktopHermesHome({ home: os.homedir(), env: { HERMES_HOME: hermesHome } })
+
     try {
-      registered = parseSpawnLedger(fs.readFileSync(path.join(hermesHome, 'spawn-ledger.json'), 'utf8'))
-        .filter(record => record.port === port).map(record => record.pid)
+      registered = parseSpawnLedger(fs.readFileSync(path.join(ledgerRoot, SPAWN_LEDGER_FILENAME), 'utf8'))
+        .filter(record => record.port === port && processes.some(candidate => candidate.pid === record.pid))
+        // A record names a (pid, create_time) incarnation; a reused PID is a different
+        // process. Same 2 s tolerance as the product's `_same_incarnation`; a record
+        // without a create_time (no psutil) carries only its PID, as in the product.
+        .filter((record) => {
+          if (record.createTime === null) {
+            return true
+          }
+
+          const started = processStartTime(record.pid)
+
+          return started !== null && Math.abs(started - record.createTime) < 2
+        })
+        .map(record => record.pid)
     } catch { /* Missing/unreadable ledger provides no attachment evidence. */ }
   }
 
@@ -271,15 +325,16 @@ export function assertBackendOrigin(backend: NativeProcess, root: string, origin
 
     // Some platforms expose no way to read another process's environment or cwd, so a
     // module-launched backend there can never name its tree in argv (Windows: the venv
-    // launcher hands the interpreter over as a system python). The listener has already
-    // been tied to the app process that owns it, and the caller has already asserted the
-    // root that app reported resolving, so those two facts together are the evidence.
-    // Requiring the process evidence to be absent keeps this from loosening a platform
-    // that can read one.
+    // launcher hands the interpreter over as a system python). When the listener is a
+    // descendant of the app, and the caller has already asserted the root that app
+    // reported resolving, those two facts together are the evidence. A ledger-registered
+    // host backend is not tied to this app by ancestry, so the app's report says nothing
+    // about it; it must carry its own argv/env/cwd evidence. Requiring the process
+    // evidence to be absent keeps this from loosening a platform that can read one.
     const processEvidenceUnreadable = backend.cwd === undefined
       && backend.pythonPath === undefined && backend.virtualEnv === undefined
 
-    const appOwnsBackend = processEvidenceUnreadable
+    const appOwnsBackend = processEvidenceUnreadable && backend.ownership !== 'host-ledger'
       && evidence.appReportedRoot !== undefined && sameTree(evidence.appReportedRoot)
 
     if (!sameTree(backend.cwd) && !namesInstallRoot && !usesInstallEnvironment && !appOwnsBackend) {
