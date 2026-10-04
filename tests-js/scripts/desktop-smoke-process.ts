@@ -5,7 +5,6 @@ import path from 'node:path'
 import { z } from 'zod'
 
 import { parseSpawnLedger } from '../../apps/desktop/electron/backend-discovery.ts'
-
 import { within } from '../../tests/install/e2e-assets/smoke-env.mjs'
 
 export interface NativeProcess {
@@ -155,12 +154,14 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   // its own child. Registration is only a candidate: the OS listener and the
   // caller's existing installed-tree checks must independently agree.
   let registered: number[] = []
+
   if (hermesHome) {
     try {
       registered = parseSpawnLedger(fs.readFileSync(path.join(hermesHome, 'spawn-ledger.json'), 'utf8'))
         .filter(record => record.port === port).map(record => record.pid)
     } catch { /* Missing/unreadable ledger provides no attachment evidence. */ }
   }
+
   const candidates = processes.filter(candidate => children.includes(candidate) || registered.includes(candidate.pid))
   let pids: number[]
 
