@@ -148,6 +148,75 @@ test.runIf(process.platform === 'linux')('origin proof finds the live child list
   } finally { child.kill(); await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) }) }
 })
 
+test.runIf(process.platform === 'linux' || process.platform === 'darwin')('a shared host listener is proven by this home ledger, not Electron ancestry', async (): Promise<void> => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-host-listener-'))
+  const child = spawn(process.execPath, ['-e', 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>console.log(s.address().port))'], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+  try {
+    const port = await new Promise<number>((resolve, reject): void => {
+      child.once('error', reject)
+      child.stdout.once('data', (data: Buffer): void => resolve(Number(data.toString().trim())))
+    })
+
+    // A reused host backend is not a descendant of the newly opened Desktop.
+    // Here the real listener itself is outside that descendant set.
+    const ledger = path.join(home, 'spawn-ledger.json')
+    const record = { pid: child.pid, purpose: 'serve', host: '127.0.0.1', port }
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+
+    for (const invalid of [{ ...record, port: port + 1 }, { ...record, pid: process.pid },
+      { ...record, isolated: true }, { ...record, purpose: 'update' }]) {
+      fs.writeFileSync(ledger, JSON.stringify([invalid]))
+      expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    }
+
+    fs.writeFileSync(ledger, JSON.stringify([record]))
+    const backend = localBackendProcess(port, child.pid!, home)
+    expect(backend.pid).toBe(child.pid)
+    expect(backend.ownership).toBe('host-ledger')
+    // Registration does not waive the installed-tree provenance check.
+    expect(() => assertBackendOrigin(backend, home, 'bundled')).toThrow('agent-payload')
+    fs.writeFileSync(ledger, 'invalid')
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+  } finally {
+    child.kill()
+    await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) })
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform === 'linux' || process.platform === 'darwin')('a host ledger record proves only its own incarnation, read at the machine root', async (): Promise<void> => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-host-root-'))
+  // A profile home: the product writes the ledger at the machine root above it.
+  const home = path.join(root, 'profiles', 'work')
+  fs.mkdirSync(home, { recursive: true })
+  const spawnedAt = Date.now() / 1000
+  const child = spawn(process.execPath, ['-e', 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>console.log(s.address().port))'], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+  try {
+    const port = await new Promise<number>((resolve, reject): void => {
+      child.once('error', reject)
+      child.stdout.once('data', (data: Buffer): void => resolve(Number(data.toString().trim())))
+    })
+
+    const record = { pid: child.pid, purpose: 'serve', host: '127.0.0.1', port, create_time: spawnedAt }
+    // The profile directory is not where the product writes the ledger.
+    fs.writeFileSync(path.join(home, 'spawn-ledger.json'), JSON.stringify([record]))
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    fs.rmSync(path.join(home, 'spawn-ledger.json'))
+    const ledger = path.join(root, 'spawn-ledger.json')
+    // A stale record whose PID now names a different process (reused PID) is no evidence.
+    fs.writeFileSync(ledger, JSON.stringify([{ ...record, create_time: spawnedAt - 3600 }]))
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    fs.writeFileSync(ledger, JSON.stringify([record]))
+    expect(localBackendProcess(port, child.pid!, home).ownership).toBe('host-ledger')
+  } finally {
+    child.kill()
+    await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) })
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('a backend bound to the tree by environment needs no root in argv', (): void => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-env-origin-'))
 
@@ -218,6 +287,14 @@ test('a platform that cannot read the backend environment proves ownership by th
     expect((): void => {
       assertBackendOrigin({ ...backend, cwd: other, pythonPath: other }, root, 'source', { appReportedRoot: root })
     }).toThrow('source tree')
+    // A ledger-registered host backend is not tied to this app by ancestry, so the
+    // app's report is no evidence for it: it needs its own argv/env evidence.
+    expect((): void => {
+      assertBackendOrigin({ ...backend, ownership: 'host-ledger' }, root, 'source', { appReportedRoot: root })
+    }).toThrow('source tree')
+    expect((): void => {
+      assertBackendOrigin({ ...backend, ownership: 'child' }, root, 'source', { appReportedRoot: root })
+    }).not.toThrow()
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
