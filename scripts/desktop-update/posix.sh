@@ -106,14 +106,14 @@ RESULT_RUN_ID="${HANDOFF_RUN:-posix-$$-${STARTED_AT}-${RANDOM}}"
 
 UI_SERVER_PID="" UI_BROWSER_PID="" UI_PANEL_PID="" UI_PROFILE_DIR="" FINAL_CODE=1
 FINAL_MSG="update did not complete"
-DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
+DONE_NOTE=""  # set when the update succeeded but the user must act (reopen, reinstall, rebuild)
 # Follow-up work that failed AFTER `hermes update` committed the new code. The
 # result stays ok:true (contract C3: ok:false only while still on the previous
 # version); each entry reaches the Desktop as a warning.
 WARNINGS=()
 MARKER_BODY=""  # the claim we published (logging; release judges identity, not bytes)
 MARKER_CLAIMED=0
-APP_REBUILD_FAILED=0
+APP_REBUILD_FAILED=0  # 1 = the code committed but the Desktop app build is an owed follow-up
 
 log() {
   if [ -n "$MARKER_OP" ]; then echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" >> "$LOG" 2>/dev/null
@@ -200,6 +200,12 @@ run_bounded() { # seconds cmd... -> cmd's stdout; 124 when it had to be killed
   wait "$pid"; rc=$?
   cat "$out" 2>/dev/null; rm -f "$out" 2>/dev/null
   return $rc
+}
+
+owed_followup_steps() { # $OUT -> the distinct owed steps, space-separated, in print order
+  # hermes_cli/update_receipt.record_followup prints each as one whole line.
+  printf '%s\n' "$OUT" | sed -n "s/^.*Update follow-up '\([A-Za-z0-9_]*\)' did not finish: .*$/\1/p" \
+    | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # Keep a durable signal breadcrumb.  A detached hand-off used to leave only the
@@ -583,6 +589,7 @@ mac_swap() {
   # user always has a launchable app, and the result file tells the truth.
   # The code update already committed, so every failure here is a follow-up
   # warning on an ok:true result, never "still on the previous version".
+  # A failed rebuild left release/ holding the OLD build: nothing new to install.
   if [ "$FINAL_CODE" -eq 0 ] && [ "$APP_REBUILD_FAILED" -eq 0 ] && [ -n "$rebuilt" ] \
       && [ -d "$RELAUNCH_TARGET" ] && [ "$rebuilt" != "$RELAUNCH_TARGET" ]; then
     publish_stage "Installing the new app"
@@ -625,7 +632,7 @@ deliver_outcome() { # the truth-determining half: swap bundles / gate the relaun
   else
     linux_gate
     if [ "$GATE" != "relaunch" ] && [ "$FINAL_CODE" -eq 0 ]; then
-      DONE_NOTE="$GATE_MSG"
+      DONE_NOTE="${DONE_NOTE:+$DONE_NOTE }$GATE_MSG"
       add_warning "relaunch" "$GATE: $GATE_MSG"
     fi
   fi
@@ -718,9 +725,10 @@ finish() {
 
   if [ -n "$DONE_NOTE" ]; then
     if [ "$GATE" != "skew" ] && [ "$GATE" != "manual" ]; then
-      # A kept/rolled-back mac bundle or a failed post-commit follow-up: bring
-      # the app back up; the note still tells the user what to re-run. A gated
-      # linux outcome (skew/manual) skips the launch BY DESIGN.
+      # A kept/rolled-back mac bundle, a failed post-commit follow-up or an owed
+      # Desktop rebuild (any OS): bring the app back up; the note still tells the
+      # user what to re-run. A gated linux outcome (skew/manual) skips the launch
+      # BY DESIGN.
       if ! launch_app; then
         # Even the kept bundle didn't come back: the durable message must
         # carry BOTH facts (update ok, previous app not reopened).
@@ -1204,6 +1212,27 @@ fi
 trap 'on_signal TERM' TERM
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete." UPDATE_COMMITTED=1
+  # Contract C3: a Desktop build that fails after the code committed is an owed
+  # follow-up (hermes update exits 0 and prints one whole "Desktop app build
+  # owed:" line for it; the follow-up text itself is truncated). The user is on
+  # the new Hermes, but this app was not rebuilt: say so and say how to fix it,
+  # never "finished OK" and never "still on the previous version".
+  if printf '%s\n' "$OUT" | grep -Eq '^[[:space:]]*Desktop app build owed: '; then
+    APP_REBUILD_FAILED=1
+    DONE_NOTE="Hermes was updated, but the Desktop app could not be rebuilt, so it still runs its old build. Run hermes desktop --force-build in a terminal to rebuild it; the update log has the build error."
+    add_warning "build" "desktop app build is an owed follow-up of the committed update"
+  fi
+  # Every other owed follow-up (a gateway still on the old code, a Windows
+  # resume, a lost completion, channel adoption, maintenance...) prints one
+  # whole "Update follow-up '<step>' did not finish:" line. None of them may
+  # end as a plain "Update complete." (review regression 1).
+  OWED_STEPS="$(owed_followup_steps)"
+  if [ -n "$OWED_STEPS" ]; then
+    case " $OWED_STEPS " in *" gateway_restart "*) OWED_HINT=" Run hermes gateway restart to move the messaging gateway onto the new code now." ;; *) OWED_HINT="" ;; esac
+    if [ -n "$DONE_NOTE" ]; then DONE_NOTE="$DONE_NOTE Follow-up steps still owed: $OWED_STEPS.$OWED_HINT"
+    else DONE_NOTE="Hermes was updated, but some follow-up steps did not finish ($OWED_STEPS). The next launch or hermes update retries them; the update log has the details.$OWED_HINT"; fi
+    add_warning "followups" "owed follow-ups of the committed update: $OWED_STEPS"
+  fi
 elif [ "$CODE" -ne 2 ] && update_committed_after_exit; then
   # Past the commit point: installed, with an owed follow-up (contract C3).
   FINAL_CODE=0 FINAL_MSG="Update complete." UPDATE_COMMITTED=1

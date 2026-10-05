@@ -39,10 +39,10 @@ class TestCallSiteWiring:
     @pytest.mark.parametrize("had_gateway", [False, True], ids=["idle", "plan-saw-gateway"])
     def test_empty_probe_settles_and_fails_only_when_rows_expected(self, monkeypatch, tmp_path, capsys, had_gateway):
         import json
-        from hermes_cli import main, update_cmd, update_cmd_fleet as fleet, update_receipt
+        from hermes_cli import main, update_cmd, update_cmd_fleet as fleet, update_cmd_fleet_verify as fleet_verify, update_receipt
 
         monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda **kw: None)
         monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
         # Reconciliation is a separate guard; it must not supply this test's failure.
@@ -59,7 +59,7 @@ class TestCallSiteWiring:
             events.append("probe")
             return []
 
-        monkeypatch.setattr(fleet, "_time", types.SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+        monkeypatch.setattr(fleet_verify, "_time", types.SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
         monkeypatch.setattr(update_receipt, "collect_fleet_versions", collect)
         restart = fleet._GatewayRestartOutcome(
             incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
@@ -69,22 +69,26 @@ class TestCallSiteWiring:
         update_receipt.begin_update_receipt()
 
         def verify():
-            fleet._verify_fleet_after_update(restart, _pre_update_plan=plan,
+            fleet_verify._verify_fleet_after_update(restart, _pre_update_plan=plan,
                                             _windows_gateway_resume=None, update_complete=True)
 
+        cleared = []
+        monkeypatch.setattr(fleet, "_clear_fleet_restart_pending_marker", lambda: cleared.append(True))
+        # Contract C3: the code is committed, so verification never fails the update (was SystemExit(1)).
+        verify()
         if had_gateway:
-            with pytest.raises(SystemExit) as failure:
-                verify()
-            assert failure.value.code == 1
             assert events[0] == "settle"
             assert events.count("probe") > 1
             assert "returned no rows" in capsys.readouterr().out
         else:
-            verify()
             assert events == ["probe"]
+        # Fail-closed survives as an OWED restart: the fleet obligation is kept armed ...
         assert restart.incomplete is had_gateway
+        assert cleared == ([] if had_gateway else [True])
         receipt = json.loads((update_cmd.get_hermes_home() / "logs/update_receipts/latest.json").read_text())
-        assert receipt["outcome"] == ("partial" if had_gateway else "success")
+        # ... and the receipt is a success that names the owed step (was outcome "partial").
+        assert receipt["outcome"] == "success"
+        assert [f["step"] for f in receipt.get("followups", [])] == (["gateway_restart"] if had_gateway else [])
 
 
 
@@ -105,3 +109,90 @@ def test_unmapped_stops_are_not_expected_rows():
     out.stopped_unmapped_pids.discard(102)
     pre, killed = out.fleet_probe_signals()
     assert _fleet_probe_expected_runtimes(_plan([]), pre, None, out.restarted_services, killed)
+
+
+def test_unmapped_stop_keeps_the_restart_owed(monkeypatch, tmp_path):
+    # Codemap §6 V7/V12: an unmapped gateway stopped with no successor used to be "accounted for"
+    # (update exit 0, obligation cleared) and stayed down silently. It still predicts no row (the
+    # test above), but the restart is now OWED: a receipt follow-up and an armed fleet obligation.
+    import json
+    from hermes_cli import main, update_cmd, update_cmd_fleet as fleet, update_cmd_fleet_verify as fleet_verify, update_receipt
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(fleet_verify, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: [])
+    cleared = []
+    monkeypatch.setattr(fleet, "_clear_fleet_restart_pending_marker", lambda: cleared.append(True))
+    out = fleet._GatewayRestartOutcome(
+        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[101], restarted_services=[],
+        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids={101}, stopped_unmapped_pids={101},
+    )
+    update_receipt.begin_update_receipt()
+    fleet_verify._verify_fleet_after_update(out, _pre_update_plan=_plan([]), _windows_gateway_resume=None,
+                                     update_complete=True)
+    receipt = json.loads((update_cmd.get_hermes_home() / "logs/update_receipts/latest.json").read_text())
+    assert receipt["outcome"] == "success"
+    assert [f["step"] for f in receipt["followups"]] == ["gateway_restart"]
+    assert "101" in receipt["followups"][0]["reason"]
+    assert cleared == []
+
+
+def test_unmapped_stop_debt_survives_startup_until_a_current_gateway_runs(monkeypatch, tmp_path):
+    # An unmapped gateway leaves no gateway_state.json, so on the next start the empty host looked
+    # gateway-less and the inventory-less obligation was discharged: the stopped gateway's restart
+    # debt vanished. Only a live gateway serving the checkout may settle it.
+    from hermes_cli import update_cmd, update_cmd_fleet as fleet, update_cmd_fleet_verify as fleet_verify
+    from hermes_cli import update_cmd_fleet_gatewayless as gatewayless, update_host_obligation as host, update_receipt
+
+    monkeypatch.setattr(host, "host_obligation_path", lambda: tmp_path / "host-update-restart.json")
+    monkeypatch.setattr(fleet, "_current_checkout_sha", lambda: "head")
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: "head")
+    monkeypatch.setattr(fleet_verify, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr("hermes_cli.update_cmd_maint._refresh_dashboard_after_update", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
+    monkeypatch.setattr(gatewayless, "host_owes_no_gateway_restart", lambda: True)
+    fleet_rows: list = []
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: list(fleet_rows))
+    fleet._write_fleet_restart_pending_marker(expected_sha="head")  # armed by the pull, inventory-less
+    out = fleet._GatewayRestartOutcome(
+        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[101], restarted_services=[],
+        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids={101}, stopped_unmapped_pids={101},
+    )
+    update_receipt.begin_update_receipt()
+    fleet_verify._verify_fleet_after_update(out, _pre_update_plan=_plan([]), _windows_gateway_resume=None,
+                                            update_complete=True)
+
+    assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
+    assert fleet._pending_fleet_restart_needed(receipt={}, pending_manual=[]) is True  # already-current update
+    assert fleet._fleet_restart_obligation_armed()
+
+    fleet_rows.append({"profile": "default", "state": "current", "code_sha": "head"})  # `hermes gateway run`
+    assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
+    assert not fleet._fleet_restart_obligation_armed()
+
+
+def test_unmapped_stop_debt_is_not_settled_by_the_mapped_gateways_restart(monkeypatch, tmp_path):
+    # The inventory owes `default` AND an unmapped gateway: `default` coming back current is the
+    # successor of `default`, not of the unmapped one, so the debt stays until a further local
+    # gateway (the unmapped one's successor, whatever profile it names) runs the checkout.
+    from hermes_cli import update_cmd_fleet as fleet, update_host_obligation as host, update_receipt
+
+    monkeypatch.setattr(host, "host_obligation_path", lambda: tmp_path / "host-update-restart.json")
+    monkeypatch.setattr(fleet, "_current_checkout_sha", lambda: "head")
+    fleet._write_fleet_restart_pending_marker(expected_sha="head", runtimes=[
+        {"kind": "gateway", "profile": "default", "pid": 7},
+        {"kind": "gateway", "profile": None, "pid": 101, "stopped_unmapped": True},
+    ])
+    fleet_rows = [{"profile": "default", "state": "current", "code_sha": "head", "pid": 8}]
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kw: list(fleet_rows))
+
+    assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is True
+    assert fleet._fleet_restart_obligation_armed()
+
+    fleet_rows.append({"profile": "work", "state": "current", "code_sha": "head", "pid": 9})
+    assert fleet._update_owes_fleet_restart(receipt={}, pending_manual=[]) is False
+    assert not fleet._fleet_restart_obligation_armed()
