@@ -11,7 +11,7 @@ import { z } from 'zod'
 
 import { resolveDesktopHermesHome } from '../../../apps/desktop/electron/data-paths.mjs'
 import { applyBundleEnvironment } from '../../../apps/desktop/scripts/bundle-env.mjs'
-import { readChatIdentity, runDesktopChatSmoke, waitForChatReady } from '../../../tests-js/scripts/desktop-chat-smoke.ts'
+import { type ChatIdentity, readChatIdentity, runDesktopChatSmoke, waitForChatReady } from '../../../tests-js/scripts/desktop-chat-smoke.ts'
 import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readInstallationCommit } from '../../../tests-js/scripts/desktop-smoke-process.ts'
 import { validateMockUrl, writeEnvFile, writeMockProviderConfig } from '../../../tests-js/scripts/mock-provider-config.ts'
 import { type MockServer, startMockServer } from '../../../tests-js/scripts/mock-server.ts'
@@ -259,6 +259,20 @@ async function verifyRunningDesktop(app: ElectronApplication, options: SmokeOpti
   return running
 }
 
+function assertResolvedIdentity(identity: ChatIdentity, options: SmokeOptions, predictedHome: string | undefined): void {
+  if (options.origin === 'source' && fs.realpathSync(identity.hermesRoot) !== fs.realpathSync(options.root)) {
+    throw new Error('Desktop resolved a different source installation')
+  }
+  // A bundled artifact that bakes its own env resolves its home itself; the
+  // app must report the home the driver predicted and seeded, not some other
+  // (possibly real, pre-existing) profile.
+  if (predictedHome) {
+    if (!identity.hermesHome || fs.realpathSync(identity.hermesHome) !== fs.realpathSync(predictedHome)) {
+      throw new Error(`Desktop resolved Hermes home ${identity.hermesHome ?? '(unreported)'} instead of the predicted ${predictedHome}`)
+    }
+  }
+}
+
 export type LaunchElectron = (launch: Parameters<typeof _electron.launch>[0]) => Promise<ElectronApplication>
 
 // `launchApp` is a parameter so a test can substitute a failing launcher and
@@ -318,17 +332,7 @@ export async function runInstalledDesktopSmoke(options: SmokeOptions, launchApp:
       throw new Error('Required local backend was replaced by a remote connection')
     }
     const identity = await readChatIdentity(page)
-    if (options.origin === 'source' && fs.realpathSync(identity.hermesRoot) !== fs.realpathSync(options.root)) {
-      throw new Error('Desktop resolved a different source installation')
-    }
-    // A bundled artifact that bakes its own env resolves its home itself; the
-    // app must report the home the driver predicted and seeded, not some other
-    // (possibly real, pre-existing) profile.
-    if (predictedHome) {
-      if (!identity.hermesHome || fs.realpathSync(identity.hermesHome) !== fs.realpathSync(predictedHome)) {
-        throw new Error(`Desktop resolved Hermes home ${identity.hermesHome ?? '(unreported)'} instead of the predicted ${predictedHome}`)
-      }
-    }
+    assertResolvedIdentity(identity, options, predictedHome)
     // The ordinary host-attach path may reuse the updater's relaunched app's
     // backend. Observe the ledger the app reads for this home (its machine root),
     // not an arbitrary listener, and retain the OS listener + installed-tree proof below.
