@@ -493,6 +493,41 @@ def _is_ancestor_pid(pid: int) -> bool:
         return False
 
 
+def _is_runtime_host(cmdline: list[str]) -> bool:
+    """A long-lived Hermes host (``gateway run`` / ``serve`` / ``dashboard``), by the canonical
+    command-line matchers (profile flags, ``hermes_cli/main.py`` paths, inline bootstraps)."""
+    from gateway.status import looks_like_gateway_command_line
+    from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
+    line = " ".join(cmdline)
+    return looks_like_gateway_command_line(line) or _hermes_holder_subcommand(line) in ("serve", "dashboard")
+
+
+def _runtime_host_below(holder_pid: int) -> bool:
+    """True when a Hermes gateway/serve/dashboard sits between us and *holder_pid* (or anywhere
+    above us when the holder is not reached).
+
+    Such a host is relaunched BY an update and outlives its stages; a ``hermes update`` its agent
+    or ``/update`` starts is an independent update that must not run under the first one's claim
+    (cli §7 V9). Unreadable command lines count as not-a-host (the legacy adoption stands).
+    """
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        proc = psutil.Process().parent()
+        for _ in range(_MAX_ANCESTRY_DEPTH):
+            if proc is None or proc.pid == holder_pid:
+                return False
+            with suppress(psutil.Error):
+                if _is_runtime_host(proc.cmdline()):
+                    return True
+            proc = proc.parent()
+    except psutil.Error:
+        return False
+    return False
+
+
 # --- the marker --------------------------------------------------------------------------
 
 
@@ -1288,6 +1323,11 @@ def update_tree_job() -> int:
     return job
 
 
+def holds_checkout_lock(install_root: Path | str | None = None) -> bool:
+    """True when this process holds (or joined) the checkout lock: it IS the running update."""
+    return _HELD is not None and os.path.realpath(_HELD["path"]) == os.path.realpath(checkout_lock_path(install_root))
+
+
 def update_in_progress(install_root: Path | str | None = None) -> bool:
     """True while an update owns this install: a LIVE marker or a held checkout lock."""
     return read_live_update(install_root=install_root) is not None or checkout_lock_held(install_root)
@@ -1299,9 +1339,9 @@ def checkout_lock_held(install_root: Path | str | None = None) -> bool:
     A probe takes the lock for the microseconds of one try and drops it (closing the fd), the
     way ``marker.sh::checkout_lock_held`` does; an updater acquiring at that instant waits
     :data:`CHECKOUT_CONTENTION_WAIT_SECONDS` instead of failing (R6/D17)."""
-    path = checkout_lock_path(install_root)
-    if _HELD is not None and _HELD["path"] == str(path):
+    if holds_checkout_lock(install_root):
         return True
+    path = checkout_lock_path(install_root)
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except OSError:
@@ -1500,7 +1540,7 @@ class UpdateLock:
         """C1 rule 4: a LIVE claim by us, an ancestor or the hand-off partner is run under.
         Called inside the marker mutex."""
         partners = _live_partners(existing)
-        if not any(self._is_partner(p) for p in partners):
+        if not any(self._is_partner(p) and (p == os.getpid() or not _runtime_host_below(p)) for p in partners):
             self.holder = UpdateHolder(pid=partners[0], age_seconds=existing.age() if existing.started_at else 0.0)
             return False
         own = _identity_line()
