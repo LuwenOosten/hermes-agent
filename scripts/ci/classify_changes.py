@@ -249,6 +249,7 @@ _UPDATE_PIPELINE = (
     "hermes_bootstrap.py",  # every launch's prepare_launch
     "hermes_constants.py",  # root home = update marker location
     "gateway/status.py",  # code_sha stamp the fleet verify reads
+    "gateway/status_inline_source.py",  # inline gateway argv the Windows pause matches (#132338)
     "gateway/control_socket.py",  # pause-for-update verb
     "gateway/code_skew.py",
     "gateway/host_rendezvous.py",
