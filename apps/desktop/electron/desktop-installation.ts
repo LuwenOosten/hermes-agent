@@ -2,6 +2,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { formatCreateTime, lockHolderIsLiveSync, processCreateTimeSync } from './update-marker'
+
 const INSTALLATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 function parseInstallationId(raw) {
@@ -41,6 +43,153 @@ function waitForRepair() {
   Atomics.wait(new Int32Array(buffer), 0, 0, 25)
 }
 
+/**
+ * The repair lock names its holder (`<pid>\nct:<creation time>\n`), so a lock
+ * left by a crashed launch is reclaimed by owner liveness instead of making
+ * every later launch throw at module init (desktop V20). An EMPTY lock is a
+ * pre-fix holder (or one between create and write): reclaimed only after it
+ * stayed empty for many polls, since it can name no owner to probe.
+ */
+const EMPTY_LOCK_RECLAIM_POLLS = 20
+
+function repairLockBody(): string {
+  const ct = processCreateTimeSync(process.pid)
+
+  return `${process.pid}\n${ct === null ? '' : `ct:${formatCreateTime(ct)}\n`}`
+}
+
+function reclaimDeadRepairLock(repairPath: string, emptyPolls: number): boolean {
+  let raw: Buffer
+  let writtenAtS: number
+
+  try {
+    raw = fs.readFileSync(repairPath)
+    writtenAtS = fs.statSync(repairPath).mtimeMs / 1000
+  } catch {
+    return false
+  }
+
+  const lines = raw.toString('utf8').split('\n')
+  const pid = /^\d+$/.test(lines[0] || '') ? Number(lines[0]) : null
+  const ctMatch = /^ct:(\d+(?:\.\d+)?)$/.exec(lines[1] || '')
+
+  const dead =
+    pid === null
+      ? emptyPolls >= EMPTY_LOCK_RECLAIM_POLLS
+      : !lockHolderIsLiveSync(pid, ctMatch ? Number(ctMatch[1]) : null, writtenAtS)
+
+  if (!dead) {
+    return false
+  }
+
+  // Rename-then-verify: a read/compare/unlink by name could delete the fresh
+  // lock a peer created after reclaiming the same dead one. The rename is the
+  // atomic claim (one reclaimer wins it); the moved file is unlinked only if it
+  // still holds the bytes judged dead, else it goes back under the name.
+  const claim = `${repairPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.reclaim`
+
+  try {
+    fs.renameSync(repairPath, claim)
+  } catch {
+    return false
+  }
+
+  let moved: Buffer | null = null
+
+  try {
+    moved = fs.readFileSync(claim)
+  } catch {
+    moved = null
+  }
+
+  if (moved?.equals(raw)) {
+    dropReclaimClaim(claim)
+
+    return true
+  }
+
+  try {
+    fs.linkSync(claim, repairPath) // never over a lock created meanwhile
+  } catch (error: any) {
+    if (error?.code !== 'EEXIST') {
+      // No hard links on this filesystem: move it back (EEXIST = a newer lock
+      // already holds the name, and its holder proceeds).
+      try {
+        fs.renameSync(claim, repairPath)
+      } catch {
+        void 0
+      }
+    }
+  }
+
+  dropReclaimClaim(claim)
+
+  return false
+}
+
+function dropReclaimClaim(claim: string) {
+  try {
+    fs.rmSync(claim, { force: true })
+  } catch {
+    void 0 // a leftover `.reclaim` sibling is inert: nothing reads it
+  }
+}
+
+/** Count consecutive empty-lock polls, then reclaim a dead lock or back off. */
+function waitOnContendedRepairLock(repairPath: string, emptyPolls: number): number {
+  let polls: number
+
+  try {
+    polls = fs.statSync(repairPath).size === 0 ? emptyPolls + 1 : 0
+  } catch {
+    polls = 0
+  }
+
+  if (!reclaimDeadRepairLock(repairPath, polls)) {
+    waitForRepair()
+  }
+
+  return polls
+}
+
+/** Replace a corrupt/unreadable ID file (never following another user's file) with a fresh ID. */
+function replaceInstallationIdFile(filePath: string, installationId: string): void {
+  try {
+    const stat = fs.lstatSync(filePath)
+
+    if (!stat.isFile() && !stat.isSymbolicLink()) {
+      throw new Error('Desktop installation ID path is not a regular file.')
+    }
+
+    if (!stat.isSymbolicLink() && typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw new Error('Desktop installation ID is owned by another user.')
+    }
+
+    fs.unlinkSync(filePath)
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') {
+      throw error
+    }
+  }
+
+  fs.writeFileSync(filePath, JSON.stringify({ installationId }), { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+}
+
+function releaseRepairLock(repairFd: number | undefined, repairPath: string, ownedBody: Buffer | null): void {
+  if (repairFd !== undefined) {
+    fs.closeSync(repairFd)
+  }
+
+  try {
+    // Compare-and-delete: never unlink a lock a reclaimer handed to someone else.
+    if (ownedBody && fs.readFileSync(repairPath).equals(ownedBody)) {
+      fs.unlinkSync(repairPath)
+    }
+  } catch {
+    void 0
+  }
+}
+
 function loadOrCreateInstallationId(filePath, randomUUID = crypto.randomUUID) {
   const existing = readInstallationId(filePath)
 
@@ -56,6 +205,9 @@ function loadOrCreateInstallationId(filePath, randomUUID = crypto.randomUUID) {
   }
 
   const repairPath = `${filePath}.repair.lock`
+
+  let emptyPolls = 0
+  let ownedBody: Buffer | null = null
 
   for (let attempt = 0; attempt < 40; attempt++) {
     let repairFd
@@ -73,49 +225,26 @@ function loadOrCreateInstallationId(filePath, randomUUID = crypto.randomUUID) {
         return winner
       }
 
-      waitForRepair()
+      emptyPolls = waitOnContendedRepairLock(repairPath, emptyPolls)
 
       continue
     }
 
     try {
+      ownedBody = Buffer.from(repairLockBody(), 'utf8')
+      fs.writeSync(repairFd, ownedBody)
+
       const winner = readInstallationId(filePath)
 
       if (winner) {
         return winner
       }
 
-      try {
-        const stat = fs.lstatSync(filePath)
-
-        if (!stat.isFile() && !stat.isSymbolicLink()) {
-          throw new Error('Desktop installation ID path is not a regular file.')
-        }
-
-        if (!stat.isSymbolicLink() && typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-          throw new Error('Desktop installation ID is owned by another user.')
-        }
-
-        fs.unlinkSync(filePath)
-      } catch (error: any) {
-        if (error?.code !== 'ENOENT') {
-          throw error
-        }
-      }
-
-      fs.writeFileSync(filePath, JSON.stringify({ installationId }), { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+      replaceInstallationIdFile(filePath, installationId)
 
       return installationId
     } finally {
-      if (repairFd !== undefined) {
-        fs.closeSync(repairFd)
-      }
-
-      try {
-        fs.unlinkSync(repairPath)
-      } catch {
-        void 0
-      }
+      releaseRepairLock(repairFd, repairPath, ownedBody)
     }
   }
 
