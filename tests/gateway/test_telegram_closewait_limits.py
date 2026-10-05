@@ -74,9 +74,7 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
         return list(fallback_ips or [])
 
     monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _no_fallback)
-    # ``raising=False``: on a base revision without the shared-context helper the
-    # pre-existing keepalive assertions still exercise their own contract.
-    monkeypatch.setattr(tg_adapter, "shared_ssl_context", _fake_shared_ssl_context, raising=False)
+    monkeypatch.setattr(tg_adapter, "shared_ssl_context", _fake_shared_ssl_context)
     monkeypatch.setattr(
         tg_adapter, "resolve_proxy_url", lambda *a, **k: proxy_url
     )

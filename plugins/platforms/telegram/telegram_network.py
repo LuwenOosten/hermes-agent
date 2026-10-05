@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
 
+# Local mirror of platform_ssl_context()'s process-wide context. platform_ssl_context()
+# already caches its own context, but the local reference exists so the warm path can
+# return without an asyncio.to_thread hop; cold initialization stays off the event loop
+# (via shared_ssl_context).
 _SSL_CONTEXT: Optional[ssl.SSLContext] = None
 _SSL_CONTEXT_LOCK = threading.Lock()
 
