@@ -51,6 +51,13 @@ class _RecordingHTTPXRequest:
         _RecordingHTTPXRequest.instances.append(self)
 
 
+_FAKE_SSL_CONTEXT = object()
+
+
+async def _fake_shared_ssl_context():
+    return _FAKE_SSL_CONTEXT
+
+
 def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
 
@@ -67,6 +74,9 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
         return list(fallback_ips or [])
 
     monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _no_fallback)
+    # ``raising=False``: on a base revision without the shared-context helper the
+    # pre-existing keepalive assertions still exercise their own contract.
+    monkeypatch.setattr(tg_adapter, "shared_ssl_context", _fake_shared_ssl_context, raising=False)
     monkeypatch.setattr(
         tg_adapter, "resolve_proxy_url", lambda *a, **k: proxy_url
     )
@@ -139,6 +149,28 @@ def _assert_updates_pool_never_reuses(instance):
     limits = instance.kwargs.get("httpx_kwargs", {}).get("limits")
     assert isinstance(limits, httpx.Limits)
     assert limits.max_keepalive_connections == 0
+
+
+def test_all_ptb_clients_share_the_platform_ssl_context(monkeypatch):
+    """Every client/transport built by _build_ptb_requests verifies with the one
+    shared platform-trust context.
+
+    A fresh context per client is what let a trust-store stall block the event
+    loop for the whole connect deadline on every reconnect attempt — the shared
+    context is built off-loop once (telegram_network.shared_ssl_context).
+    """
+    for proxy_url in ("http://127.0.0.1:9/", None):
+        instances = _drive_connect(monkeypatch, proxy_url=proxy_url)
+        assert instances, "connect() built no HTTPXRequest — test setup is wrong"
+        for inst in instances:
+            assert inst.kwargs["httpx_kwargs"].get("verify") is _FAKE_SSL_CONTEXT
+
+    instances = _drive_connect(monkeypatch, proxy_url=None, fallback_ips=["149.154.167.220"])
+    assert instances
+    for inst in instances:
+        transport = inst.kwargs["httpx_kwargs"]["transport"]
+        assert transport._transport_kwargs.get("verify") is _FAKE_SSL_CONTEXT
+        asyncio.run(transport.aclose())
 
 
 def test_proxy_branch_general_pool_has_tight_keepalive(monkeypatch):

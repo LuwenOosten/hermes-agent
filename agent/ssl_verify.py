@@ -109,6 +109,18 @@ def _shared_context(ca_path: str | None) -> ssl.SSLContext:
         return ctx
 
 
+def platform_ssl_context() -> ssl.SSLContext:
+    """The shared client context backed by the platform trust store.
+
+    ``_shared_context(None)`` is cached process-wide, so every caller reuses
+    one identity (and one trust-store load). First construction can block in
+    the OS verifier; event-loop callers must build it via ``asyncio.to_thread``
+    before their first HTTPS client.
+    """
+    install_truststore()
+    return _shared_context(None)
+
+
 def resolve_httpx_verify(
     *,
     ca_bundle: Optional[str] = None,

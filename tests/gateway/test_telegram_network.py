@@ -383,6 +383,153 @@ class FakeDoHClient:
     async def __aexit__(self, *args):
         pass
 
+class TestSharedSslContext:
+    """``shared_ssl_context()`` builds the platform-trust context off-loop, exactly once.
+
+    httpx builds a fresh SSL context (cafile load included) for every client it
+    constructs.  With truststore that synchronous construction runs inside the
+    OS verifier, so on the event loop it freezes every callback — including the
+    connect deadline's own expiry.  The shared context must be built in a worker
+    thread, cached, and reused by every caller.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_cached_context(self, monkeypatch):
+        monkeypatch.setattr(tnet, "_SSL_CONTEXT", None)
+
+    @pytest.mark.asyncio
+    async def test_first_build_is_off_loop_and_loop_keeps_running(self, monkeypatch):
+        """The blocking trust-store load runs in a worker; loop timers still fire.
+
+        The factory stands in for the OS verifier stall.  ``threading.Event``s
+        synchronise the test with the worker — no sleeps and no tick counting:
+        returning from ``await to_thread(started.wait)`` at all proves the loop
+        dispatched a callback while *another* thread sat inside the factory.
+        """
+        import asyncio
+        import ssl
+        import threading
+
+        real_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        build_started = threading.Event()
+        release_build = threading.Event()
+        build_threads: list = []
+
+        def _blocking_platform_context():
+            build_threads.append(threading.current_thread())
+            build_started.set()
+            release_build.wait(timeout=5.0)
+            return real_ctx
+
+        import agent.ssl_verify as ssl_verify
+        monkeypatch.setattr(ssl_verify, "platform_ssl_context", _blocking_platform_context)
+
+        task = asyncio.ensure_future(tnet.shared_ssl_context())
+        try:
+            started = await asyncio.wait_for(asyncio.to_thread(build_started.wait), timeout=2.0)
+            assert started, "the shared context factory never ran"
+            assert build_threads and build_threads[0] is not threading.main_thread(), (
+                "platform_ssl_context() built on the event-loop thread; a stalled "
+                "trust-store load would freeze the gateway"
+            )
+            # The loop's own timers must still fire while the build is blocked —
+            # the connect deadline is a loop timer whose expiry callback must not
+            # be starved by context construction.
+            timer_fired = asyncio.Event()
+            asyncio.get_running_loop().call_soon(timer_fired.set)
+            await asyncio.wait_for(timer_fired.wait(), timeout=2.0)
+            assert not task.done(), "shared_ssl_context() returned before the factory was released"
+            release_build.set()
+            ctx = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            release_build.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert ctx is real_ctx
+
+    @pytest.mark.asyncio
+    async def test_deadline_fires_while_first_build_stalls(self, monkeypatch):
+        """The production bound (``agent.deadline``) expires while the build is blocked.
+
+        ``_build_ptb_requests`` and ``discover_fallback_ips`` run under
+        ``run_bounded_async``, whose thread timer completes only if the loop can
+        process the expiry callback.  With the build off-loop the deadline still
+        fires at 2s even though the factory never returned — on the event loop it
+        would be starved for the full stall.
+        """
+        import asyncio
+        import ssl
+        import threading
+        import time
+
+        from agent.deadline import run_bounded_async
+
+        real_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        release_build = threading.Event()
+
+        def _blocking_platform_context():
+            release_build.wait(timeout=5.0)
+            return real_ctx
+
+        import agent.ssl_verify as ssl_verify
+        monkeypatch.setattr(ssl_verify, "platform_ssl_context", _blocking_platform_context)
+
+        started_at = time.monotonic()
+        try:
+            result = await run_bounded_async(
+                tnet.shared_ssl_context(), timeout=2.0, label="shared_ssl_context", dump_on_blocked_loop=False)
+        finally:
+            release_build.set()
+
+        assert result.timed_out is True, "the 2s production deadline did not fire during a stalled build"
+        assert time.monotonic() - started_at >= 2.0, "deadline returned before its own timeout"
+
+        # The deadline abandons the coroutine, not the worker thread: wait for the
+        # worker to finish writing the cache while the patch is still installed,
+        # so its late write cannot race the fixture teardown.
+        wait_until = time.monotonic() + 2.0
+        while tnet._SSL_CONTEXT is not real_ctx and time.monotonic() < wait_until:
+            await asyncio.to_thread(release_build.wait, 0.01)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_callers_build_once_and_share_identity(self, monkeypatch):
+        """N concurrent cold callers trigger one build; every caller gets it."""
+        import asyncio
+        import ssl
+        import threading
+
+        real_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        build_started = threading.Event()
+        release_build = threading.Event()
+        build_calls = []
+
+        def _blocking_platform_context():
+            build_calls.append(1)
+            build_started.set()
+            release_build.wait(timeout=5.0)
+            return real_ctx
+
+        import agent.ssl_verify as ssl_verify
+        monkeypatch.setattr(ssl_verify, "platform_ssl_context", _blocking_platform_context)
+
+        tasks = [asyncio.ensure_future(tnet.shared_ssl_context()) for _ in range(8)]
+        try:
+            started = await asyncio.wait_for(asyncio.to_thread(build_started.wait), timeout=2.0)
+            assert started
+            release_build.set()
+            contexts = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
+        finally:
+            release_build.set()
+
+        assert len(build_calls) == 1, f"cold concurrent callers built the context {len(build_calls)} times"
+        assert all(ctx is real_ctx for ctx in contexts)
+        # A warm call reuses the cache and never enters the factory again.
+        assert await tnet.shared_ssl_context() is real_ctx
+        assert len(build_calls) == 1
+
+
 class TestDiscoverFallbackIps:
     """Tests for discover_fallback_ips() — DoH-based auto-discovery."""
 
@@ -453,6 +600,61 @@ class TestDiscoverFallbackIps:
 
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.166.110"]
+
+    @pytest.mark.asyncio
+    async def test_client_construction_does_not_block_event_loop(self, monkeypatch):
+        """Client construction must stay off the event loop (#63309 class).
+
+        httpx builds an SSL context per client; with truststore that load is a
+        synchronous OS call that can block for seconds.  On the loop it freezes
+        every callback — including the connect deadline's expiry — so reconnect
+        attempts time out even though the network path is fine.
+        """
+        import asyncio
+        import threading
+
+        client = FakeDoHClient({"https://dns.google": (200, _doh_answer("149.154.167.220"))})
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        construction_threads: list = []
+
+        def _stalled_async_client_factory(**kwargs):
+            construction_threads.append(threading.current_thread())
+            construction_started.set()
+            release_construction.wait(timeout=5.0)  # stands in for truststore.load_verify_locations
+            return client
+
+        monkeypatch.setattr(tnet.httpx, "AsyncClient", _stalled_async_client_factory)
+        monkeypatch.setattr(tnet.socket, "getaddrinfo", lambda *a, **kw: [])
+        # The shared context is exercised by TestSharedSslContext; keep this test on
+        # the construction seam only. ``raising=False`` keeps the base-revision red
+        # run failing on the construction-thread assertion, not an AttributeError.
+        monkeypatch.setattr(tnet, "_SSL_CONTEXT", object(), raising=False)
+
+        task = asyncio.ensure_future(tnet.discover_fallback_ips())
+        try:
+            started = await asyncio.wait_for(asyncio.to_thread(construction_started.wait), timeout=2.0)
+            assert started, "AsyncClient construction never started"
+            assert construction_threads and construction_threads[0] is not threading.main_thread(), (
+                "httpx.AsyncClient was constructed on the event-loop thread; a stalled "
+                "trust-store load would freeze the gateway"
+            )
+            # The loop must still process callbacks while construction is blocked —
+            # the production failure froze the connect deadline's own expiry.
+            timer_fired = asyncio.Event()
+            asyncio.get_running_loop().call_soon(timer_fired.set)
+            await asyncio.wait_for(timer_fired.wait(), timeout=2.0)
+            assert not task.done(), "discovery finished while the factory was still blocked"
+            release_construction.set()
+            ips = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            release_construction.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert ips == ["149.154.167.220"]
+        assert client.requests_made, "the fake DoH client was never queried"
 
     @pytest.mark.asyncio
     async def test_hung_system_dns_does_not_gate_doh_results(self, monkeypatch):

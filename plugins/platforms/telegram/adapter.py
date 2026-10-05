@@ -180,7 +180,8 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env,
+    shared_ssl_context, tcp_keepalive_socket_options)
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -3028,6 +3029,11 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
+        # One platform-trust SSL context shared by every client/transport below. httpx builds a
+        # fresh context per client, and with truststore that synchronous construction can block
+        # in the OS trust store — on the event loop it froze the gateway past the connect
+        # deadline on every reconnect attempt. shared_ssl_context() builds it off-loop, once.
+        ssl_context = await shared_ssl_context()
         # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
         request_kwargs = {
             "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
@@ -3095,7 +3101,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if fallback_ips and not proxy_url and not disable_fallback:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
             # Separate request/update pools reduce contention during polling reconnect + bootstrap calls.
-            _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options()}
+            _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options(), "verify": ssl_context}
             # Keep request/update pools separate to reduce contention during polling reconnect + bot API
             # bootstrap/delete_webhook calls. httpx ignores the client-level `limits` kwarg when a custom
             # `transport` is supplied (#58790). Unlike the proxy/direct branches (which inject limits at the
@@ -3112,11 +3118,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 {"transport": TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs)})
         elif proxy_url:
             logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
+            request, get_updates_request = _pair(
+                _with_limits({"verify": ssl_context}), {"limits": _updates_limits, "verify": ssl_context}, proxy=proxy_url)
         else:
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
+            request, get_updates_request = _pair(
+                _with_limits({"verify": ssl_context}), {"limits": _updates_limits, "verify": ssl_context})
         return request, self._instrument_polling_request(get_updates_request)
 
     async def _initialize_app_with_retries(self, builder) -> None:

@@ -7,6 +7,8 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import ssl
+import threading
 from typing import Iterable, Optional
 
 import httpx
@@ -14,6 +16,42 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
+
+_SSL_CONTEXT: Optional[ssl.SSLContext] = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def _shared_ssl_context_sync() -> ssl.SSLContext:
+    """Build (once per process) the platform-trust context used by every Telegram client.
+
+    truststore's first load can block for seconds inside the OS trust store, so
+    event-loop callers must reach this through :func:`shared_ssl_context`.
+    """
+    global _SSL_CONTEXT
+    ctx = _SSL_CONTEXT
+    if ctx is not None:
+        return ctx
+    with _SSL_CONTEXT_LOCK:
+        if _SSL_CONTEXT is None:
+            from agent.ssl_verify import platform_ssl_context
+
+            _SSL_CONTEXT = platform_ssl_context()
+        return _SSL_CONTEXT
+
+
+async def shared_ssl_context() -> ssl.SSLContext:
+    """Off-loop access to the shared platform-trust context.
+
+    httpx builds a fresh SSL context (cafile load included) for every client
+    and transport it constructs. On a machine where that synchronous load
+    stalls, constructing clients on the event loop freezes the whole gateway —
+    including the connect deadline's own expiry callback — so reconnect
+    attempts time out even though the network path is fine.
+    """
+    ctx = _SSL_CONTEXT
+    if ctx is not None:
+        return ctx
+    return await asyncio.to_thread(_shared_ssl_context_sync)
 
 
 def _describe_transport_error(error: Exception) -> str:
@@ -265,7 +303,12 @@ async def discover_fallback_ips() -> list[str]:
     IP is the most reliable path to api.telegram.org and a transient primary-path failure should be retried
     against the same address via the IP-rewrite path before the seed list is consulted (#14520).
     """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
+    # Client construction sets up the SSL context synchronously; keep it off the
+    # event loop so a stalled trust-store load cannot freeze the gateway (#63309 class).
+    ssl_context = await shared_ssl_context()
+    client = await asyncio.to_thread(
+        httpx.AsyncClient, timeout=httpx.Timeout(_DOH_TIMEOUT), verify=ssl_context)
+    async with client:
         system_dns_task = asyncio.ensure_future(asyncio.to_thread(_resolve_system_dns))
         results = await asyncio.gather(*[_query_doh_provider(client, p) for p in _DOH_PROVIDERS], return_exceptions=True)
     # The getaddrinfo leg has no timeout of its own and only feeds the log line below — bound it.
