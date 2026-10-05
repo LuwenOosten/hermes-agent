@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd, update_cmd_zip
 from hermes_constants import venv_bin_dir, venv_python_path
 
 # ---------------------------------------------------------------------------
@@ -169,16 +169,16 @@ def test_file_swap_failure_restores_the_original_file(tmp_path, monkeypatch):
         for n in ("cli.py", "run_agent.py")
     ]
 
-    real_rename = os.rename
+    real_replace = os.replace
     calls = {"n": 0}
 
-    def flaky_rename(src, dst):
+    def flaky_replace(src, dst):  # a root file swaps in by os.replace over its hardlinked backup
         calls["n"] += 1
-        if calls["n"] == 4:
+        if calls["n"] == 2:
             raise OSError("simulated AV interference")
-        return real_rename(src, dst)
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(update_cmd.os, "rename", flaky_rename)
+    monkeypatch.setattr(update_cmd.os, "replace", flaky_replace)
     with pytest.raises(OSError):
         update_cmd._commit_staged_replacements(staged)
     monkeypatch.undo()
@@ -287,6 +287,65 @@ def test_staging_restores_backup_when_dst_is_missing(tmp_path, monkeypatch):
     assert (live / "agent" / "version.txt").read_text() == "new"
     assert not [p for p in os.listdir(live) if "hermes-update" in p]
 
+def test_staging_restores_a_dangling_symlink_backup_instead_of_deleting_it(tmp_path):
+    """The leftover-backup restore tested ``exists()``: a dangling symlink backup (the only copy of a
+    tracked symlink entry) read as absent and the leftover sweep deleted it (review Z3)."""
+    live, new = tmp_path / "live", tmp_path / "new"
+    live.mkdir()
+    new.mkdir()
+    (new / "alpha").write_text("NEW")
+    backup = live / "alpha.hermes-update-old"
+    try:
+        backup.symlink_to("gone.txt")
+    except OSError:
+        pytest.skip("symlinks need privileges here")
+    update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha"))
+    assert (live / "alpha").is_symlink() and os.readlink(live / "alpha") == "gone.txt"
+    assert not os.path.lexists(backup)
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_a_symlink_planted_at_the_staging_path_after_the_sweep_is_never_written_through(tmp_path, monkeypatch, kind):
+    """_stage_replacement swept the fixed staging name, checked it was gone, then copy2'd to that same
+    path: a symlink planted in between carried the extracted bytes outside the install (review Z2).
+    The stage now fails closed on the planted entry; the external file keeps its bytes."""
+    live, new, outside = tmp_path / "live", tmp_path / "new", tmp_path / "outside"
+    for d in (live, new, outside):
+        d.mkdir()
+    victim = outside / ("sentinel.txt" if kind == "file" else "sentinel")
+    if kind == "file":
+        victim.write_text("SENTINEL")
+        (new / "alpha").write_text("NEW")
+    else:
+        victim.mkdir()
+        (new / "alpha").mkdir()
+        (new / "alpha" / "x.py").write_text("NEW")
+    (live / "alpha").write_text("OLD") if kind == "file" else (live / "alpha").mkdir()
+    staging = live / "alpha.hermes-update-staging"
+    real_isdir = os.path.isdir
+
+    def plant_then_isdir(path):  # the barrier: after the sweep and its lexists check, before the copy
+        if str(path) == str(new / "alpha") and not os.path.lexists(staging):
+            try:
+                staging.symlink_to(victim)
+            except OSError:
+                pytest.skip("symlinks need privileges here")
+        return real_isdir(path)
+
+    monkeypatch.setattr(update_cmd_zip.os.path, "isdir", plant_then_isdir)
+    with pytest.raises(OSError):
+        update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha"))
+    monkeypatch.undo()
+    if kind == "file":
+        assert victim.read_text() == "SENTINEL"
+    else:
+        assert list(victim.iterdir()) == []
+    staging.unlink()  # the planted link (only the link) goes; a healthy stage then proceeds
+    update_cmd._commit_staged_replacements([(update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha")),
+                                             str(live / "alpha"))])
+    assert (live / "alpha" if kind == "file" else live / "alpha" / "x.py").read_text() == "NEW"
+
+
 def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypatch):
     """Phase-2 failure must not orphan staging copies for unswapped entries.
 
@@ -327,3 +386,397 @@ def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypa
     # ...and zero litter of any kind (staging OR backup).
     litter = [p for p in os.listdir(live) if "hermes-update" in p]
     assert litter == [], f"orphaned update litter: {litter}"
+
+
+@pytest.mark.parametrize("hardlinks", [True, False])
+def test_root_files_never_go_missing_mid_swap(tmp_path, monkeypatch, hardlinks):
+    """Every launcher imports ``hermes_constants``/``hermes_bootstrap`` before anything else, and
+    ``hermes_bootstrap`` is what reaches the restore after a killed swap: a kill between any two
+    filesystem steps must find every root file present (old or new bytes), only directories moved.
+    That holds on filesystems without hardlinks too (FAT32/exFAT/SMB)."""
+    if not hardlinks:
+        def no_link(*_a, **_k):
+            raise OSError(1, "Operation not permitted")
+        monkeypatch.setattr(update_cmd_zip.os, "link", no_link)
+    live, new = tmp_path / "live", tmp_path / "new"
+    for side, text in ((live, "old"), (new, "new")):
+        (side / "hermes_cli").mkdir(parents=True)
+        (side / "hermes_cli" / "main.py").write_text(text, encoding="utf-8")
+        for name in ("hermes_constants.py", "hermes_bootstrap.py"):
+            (side / name).write_text(text, encoding="utf-8")
+    names = ("hermes_constants.py", "hermes_cli", "hermes_bootstrap.py")
+    staged = [(update_cmd._stage_replacement(str(new / n), str(live / n)), str(live / n)) for n in names]
+    missing: list[str] = []
+
+    def probing(real):
+        def step(src, dst):
+            real(src, dst)
+            missing.extend(n for n in ("hermes_constants.py", "hermes_bootstrap.py") if not (live / n).is_file())
+        return step
+
+    monkeypatch.setattr(update_cmd.os, "rename", probing(os.rename))
+    monkeypatch.setattr(update_cmd.os, "replace", probing(os.replace))
+    update_cmd._commit_staged_replacements(staged)
+    monkeypatch.undo()
+    assert not missing, f"root modules absent mid-swap: {missing}"
+    assert {n: (live / n).read_text(encoding="utf-8-sig") for n in ("hermes_constants.py", "hermes_bootstrap.py")} == {
+        "hermes_constants.py": "new", "hermes_bootstrap.py": "new"}
+    assert not [p for p in os.listdir(live) if "hermes-update" in p]
+
+
+# ---------------------------------------------------------------------------
+# ZIP swap owner lock and staging journal (_early_recovery / _journaled_stage_and_swap)
+# ---------------------------------------------------------------------------
+
+_LOCK_ROLE = r'''
+import json, os, sys, time
+from pathlib import Path
+from hermes_cli import _early_recovery as er
+role, work = sys.argv[1], Path(sys.argv[2])
+live, lock_path = work / "live", work / "live" / ".hermes-update-zip-swap.lock"
+def wait_for(name):
+    end = time.time() + 30
+    while not (work / name).exists():
+        if time.time() > end:
+            raise SystemExit(f"{role}: no {name}")
+        time.sleep(0.01)
+def mark(name, owned):
+    (work / name).write_text(json.dumps({"owned": bool(owned), "inode": os.stat(lock_path).st_ino
+                                         if lock_path.exists() else None}))
+if role == "a":  # owner whose release is caught right after its unlock: B already holds the inode
+    real = er._lock_fd
+    def lock_fd(fd, lock):
+        done = real(fd, lock)
+        if not lock:
+            wait_for("b")
+        return done
+    er._lock_fd = lock_fd
+    with er.zip_swap_owner_lock(live) as owned:
+        mark("a", owned)
+        wait_for("b-waiting"); time.sleep(0.3)
+    (work / "a-done").touch()
+elif role == "b":  # waiter that wins the lock as A lets go
+    wait_for("a"); (work / "b-waiting").touch()
+    with er.zip_swap_owner_lock(live, wait=20) as owned:
+        mark("b", owned)
+        wait_for("c")
+else:  # newcomer after A's release completed
+    wait_for("a-done")
+    with er.zip_swap_owner_lock(live) as owned:
+        mark("c", owned)
+'''
+
+
+def test_zip_swap_lock_is_one_inode_across_a_release(tmp_path):
+    """Three real processes: A releases while B waits; B wins. C must then be refused: a release that
+    unlinks the lock path lets C lock a fresh inode next to B's (two "exclusive" owners)."""
+    import json
+    import subprocess
+    import sys
+
+    (tmp_path / "live").mkdir()
+    repo = os.path.realpath(Path(update_cmd.__file__).parent.parent)
+    procs = [subprocess.Popen([sys.executable, "-c", _LOCK_ROLE, role, str(tmp_path)], cwd=repo,
+                              env={**os.environ, "PYTHONPATH": repo}) for role in "abc"]
+    assert [p.wait(timeout=90) for p in procs] == [0, 0, 0]
+    a, b, c = (json.loads((tmp_path / r).read_text()) for r in "abc")
+    assert a["owned"] and b["owned"]
+    assert not c["owned"], f"two processes held the ZIP swap lock at once (inodes {b['inode']} and {c['inode']})"
+    assert a["inode"] == b["inode"] == c["inode"]
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX permission bits; root ignores them")
+def test_zip_swap_lock_refuses_admission_without_a_lock(tmp_path):
+    """A root where the lock file cannot be created grants nothing: no lock, no swap, and a named reason."""
+    from hermes_cli._early_recovery import zip_swap_owner_lock
+
+    live = tmp_path / "live"
+    live.mkdir()
+    live.chmod(0o555)
+    try:
+        with zip_swap_owner_lock(live) as owned:
+            assert not owned, "admitted to the ZIP swap without holding any lock"
+            assert owned.reason.startswith("cannot open the ZIP swap lock")
+        with pytest.raises(RuntimeError, match="no ZIP swap lock"):
+            update_cmd_zip._journaled_stage_and_swap(str(tmp_path), [], live, None)
+    finally:
+        live.chmod(0o755)
+
+
+def _unreadable_release(tmp_path: Path, *, read_only_dir: bool) -> tuple[Path, Path, list[Path]]:
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    live.mkdir()
+    extracted.mkdir()
+    (live / "keep.txt").write_text("live data")
+    (extracted / "first.txt").write_text("new first")
+    (extracted / "second").mkdir()
+    (extracted / "second" / "good.txt").write_text("new copied data")
+    locked = []
+    if read_only_dir:  # copytree copies its mode: the partial stage gets a directory nobody can empty
+        ro = extracted / "second" / "aaa_ro"
+        ro.mkdir()
+        (ro / "x.txt").write_text("x")
+        locked.append(ro)
+    blocked = extracted / "second" / "zzz_no_read.txt"
+    blocked.write_text("unreadable")
+    locked.append(blocked)
+    for path in locked:
+        path.chmod(0o555 if path.is_dir() else 0)
+    return live, extracted, locked
+
+
+_POSIX_MODES = pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                                  reason="POSIX permission bits; root ignores them")
+
+
+@_POSIX_MODES
+def test_unreadable_source_file_leaves_no_partial_stage(tmp_path):
+    """The copy of ``second`` dies on an unreadable file after copying the rest: that partial staging
+    tree is the failing entry's and must be dropped like the finished ones (nothing live changes)."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted, locked = _unreadable_release(tmp_path, read_only_dir=False)
+    try:
+        with pytest.raises(OSError):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), ["first.txt", "second"], live, None)
+    finally:
+        for path in locked:
+            path.chmod(0o755)
+    assert not list(live.glob("*.hermes-update-staging")), "a partial stage leaked past the failed copy"
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
+    assert restore_interrupted_zip_swap(live) is False
+    assert sorted(p.name for p in live.iterdir()) == [".hermes-update-zip-swap.lock", "keep.txt"]
+
+
+@_POSIX_MODES
+def test_a_stage_cleanup_that_cannot_finish_keeps_the_journal_for_recovery(tmp_path):
+    """When the updater cannot remove its partial stage, the journal is that stage's only record: it
+    stays, and the next launch's recovery removes the stage, then the journal."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted, locked = _unreadable_release(tmp_path, read_only_dir=True)
+    try:
+        with pytest.raises(OSError):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), ["first.txt", "second"], live, None)
+    finally:
+        for path in locked:
+            path.chmod(0o755)
+    assert (live / "second.hermes-update-staging").exists(), "harness: the cleanup was expected to fail"
+    assert (live / ZIP_SWAP_JOURNAL).exists(), "the journal went while its staging path was still on disk"
+    assert restore_interrupted_zip_swap(live) is False  # nothing live moved: no relaunch
+    assert not list(live.glob("*.hermes-update-staging")) and not (live / ZIP_SWAP_JOURNAL).exists()
+    assert (live / "keep.txt").read_text() == "live data"
+
+
+def _swap_or_recover(extracted: Path, entries: list[str], live: Path) -> None:
+    """``_download_and_swap_zip``'s wiring: a failed swap is settled from its journal right after."""
+    from hermes_cli._early_recovery import restore_interrupted_zip_swap
+
+    try:
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), entries, live, None)
+    except Exception:
+        restore_interrupted_zip_swap(live)
+
+
+@_POSIX_MODES
+def test_a_stale_backup_never_stands_in_for_the_live_entry(tmp_path, monkeypatch):
+    """A leftover ``<entry>.hermes-update-old`` this swap did not make (a pre-journal crash holding a
+    read-only directory) must be removed or refuse the swap; it must never become the live entry."""
+    from hermes_cli import update_cmd_commit
+
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    (live / "pkg").mkdir(parents=True)
+    (live / "pkg" / "m.py").write_text("LIVE_OLD", encoding="utf-8")
+    (extracted / "pkg").mkdir(parents=True)
+    (extracted / "pkg" / "m.py").write_text("NEW", encoding="utf-8")
+    stale = live / "pkg.hermes-update-old" / "ro"
+    stale.mkdir(parents=True)
+    (stale / "f").write_text("stale remnant", encoding="utf-8")
+    stale.chmod(0o555)
+    try:
+        _swap_or_recover(extracted, ["pkg"], live)
+    finally:
+        for path in live.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o755)
+    module = live / "pkg" / "m.py"
+    assert module.is_file() and module.read_text(encoding="utf-8-sig") in ("LIVE_OLD", "NEW"), sorted(
+        str(p.relative_to(live)) for p in live.rglob("*"))
+
+
+def test_a_failed_swap_keeps_a_file_the_user_made_at_a_never_installed_entry(tmp_path, monkeypatch):
+    """The swap fails before ``brand_new`` is installed; a file the user created there meanwhile is
+    theirs, and neither the rollback nor the journal recovery may delete it."""
+    from hermes_cli import update_cmd_commit
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    for side, text in ((live, "old"), (extracted, "new")):
+        (side / "a").mkdir(parents=True)
+        (side / "a" / "v.txt").write_text(text, encoding="utf-8")
+    (extracted / "brand_new").write_text("new entry", encoding="utf-8")
+    user_file = live / "brand_new"
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations",
+                        lambda *a, **k: user_file.write_text("USER NOTE", encoding="utf-8"))
+    real_rename = os.rename
+
+    def refuse_moving_a(src, dst):  # Windows AV holding ``a`` open
+        if os.fspath(src) == str(live / "a") and os.fspath(dst).endswith(".hermes-update-old"):
+            raise PermissionError(13, "in use")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(update_cmd_zip.os, "rename", refuse_moving_a)
+    _swap_or_recover(extracted, ["a", "brand_new"], live)
+    monkeypatch.undo()
+    assert user_file.is_file() and user_file.read_text(encoding="utf-8-sig") == "USER NOTE"
+    assert (live / "a" / "v.txt").read_text(encoding="utf-8-sig") == "old"
+    assert not [p.name for p in live.iterdir() if "hermes-update-staging" in p.name or p.name.endswith("-old")]
+
+def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_update(tmp_path, monkeypatch):
+    """The swap committed: an AV scan holding the journal must not turn it into a reported failure
+    that disarms the new tree's completion obligations (F19)."""
+    from hermes_cli import update_cmd_commit
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    _live_tree(live, {"payload": "old"})
+    _live_tree(extracted, {"payload": "new"})
+    real = Path.unlink
+
+    def held(self, *args, **kwargs):
+        if self.name == update_cmd_zip.ZIP_SWAP_JOURNAL:
+            raise PermissionError(13, "being used by another process", str(self))
+        return real(self, *args, **kwargs)
+
+    update_cmd_commit.reset_for_tests()
+    monkeypatch.setattr(Path, "unlink", held)
+    try:
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), ["payload"], live, "b" * 40)
+        assert update_cmd_commit.commit_obligations_armed()
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert (live / "payload" / "version.txt").read_text(encoding="utf-8-sig") == "new"
+
+
+def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_path):
+    """On a file system without hardlinks ``_file_backup`` copies to ``<entry>.hermes-update-old.tmp``
+    first. A kill inside that copy left the temp behind: recovery dropped only staging and the backup,
+    so every later ZIP update refused on "uncommitted changes" (review C4)."""
+    from hermes_cli._early_recovery import (
+        ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity)
+
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "a.py").write_text("old\n", encoding="utf-8")
+    (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
+    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text("ol", encoding="utf-8")  # the killed copy
+    write_zip_swap_journal(live, "swapping", [["a.py", True, zip_entry_identity(live / "a.py.hermes-update-staging"),
+                                              zip_entry_identity(live / "a.py")]], "0123456789ab")
+
+    restore_interrupted_zip_swap(live)
+
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
+    assert sorted(p.name for p in live.iterdir() if not p.name.endswith(".lock")) == ["a.py"]
+    assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
+
+
+def _swap_killed(tmp_path, monkeypatch, *, live: dict, new: dict, install_first: bool) -> Path:
+    """Run the real journaled stage+swap and kill it inside the swap: nothing renamed yet, or only the
+    first staged entry renamed into place. The journal the real writer left is what recovery reads."""
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL
+
+    root, extracted = tmp_path / "live", tmp_path / "extracted"
+    for d, files in ((root, live), (extracted, new)):
+        d.mkdir()
+        for name, text in files.items():
+            (d / name).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
+
+    def killed(staged, **_kw):
+        if install_first:  # the real swap's first step: backup (hardlink) when live, then the rename
+            staging, dst = staged[0]
+            if os.path.lexists(dst):
+                update_cmd_zip._file_backup(dst, dst + ".hermes-update-old")
+            os.replace(staging, dst)
+        raise RuntimeError("killed mid-swap")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(update_cmd_zip, "_commit_staged_replacements", killed)
+        with pytest.raises(RuntimeError, match="killed"):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), sorted(new), root, None)
+    assert (root / ZIP_SWAP_JOURNAL).exists(), "harness: the kill must leave the journal"
+    return root
+
+
+def test_recovery_never_installs_or_deletes_a_backup_suffix_created_after_the_kill(tmp_path, monkeypatch):
+    """A swap killed before any rename; then a user file appears at ``cli.py.hermes-update-old``. The
+    path-only journal took it for the swap's backup: it overwrote the live cli.py with it, and the old
+    bytes were gone (review Z1). Recovery now proves a backup is the entry it recorded before using or
+    deleting it: the live file stays, the user's file is kept aside, byte for byte."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={"cli.py": "LIVE"}, new={"cli.py": "NEW"}, install_first=False)
+    (root / "cli.py.hermes-update-old").write_text("USER LATER", encoding="utf-8")
+
+    restore_interrupted_zip_swap(root)
+
+    assert (root / "cli.py").read_text(encoding="utf-8") == "LIVE"
+    kept = [p for p in root.iterdir() if p.read_bytes() == b"USER LATER"]
+    assert len(kept) == 1 and kept[0].name != "cli.py"
+    assert not (root / "cli.py.hermes-update-staging").exists() and not (root / ZIP_SWAP_JOURNAL).exists()
+
+
+def test_recovery_never_deletes_a_user_file_that_replaced_an_installed_entry(tmp_path, monkeypatch):
+    """A new entry (notes.md) was renamed into place, then the swap was killed; the user then replaced
+    notes.md with a file of their own. Recovery deleted whatever sat at the journaled name (review Z1);
+    only the entry the swap installed (its recorded staging identity) may go."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={}, new={"notes.md": "NEW"}, install_first=True)
+    (root / "notes.md").unlink()
+    (root / "notes.md").write_text("USER NOTES", encoding="utf-8")
+
+    restore_interrupted_zip_swap(root)
+
+    assert [p.read_text(encoding="utf-8") for p in root.iterdir() if p.name.startswith("notes.md")] == ["USER NOTES"]
+    assert not (root / ZIP_SWAP_JOURNAL).exists()
+
+
+def test_recovery_still_rolls_back_an_authentic_killed_swap(tmp_path, monkeypatch):
+    """The control: a swap killed after installing its first entry rolls back to the old tree, and every
+    staging copy and backup the swap itself made is deleted (provenance proven), with nothing kept aside."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={"a.py": "OLD_A", "b.py": "OLD_B"},
+                        new={"a.py": "NEW_A", "b.py": "NEW_B", "c.py": "NEW_C"}, install_first=True)
+    assert (root / "a.py").read_text(encoding="utf-8") == "NEW_A", "harness: a.py was installed"
+    assert restore_interrupted_zip_swap(root) is True
+    assert {p.name: p.read_text(encoding="utf-8") for p in root.iterdir() if not p.name.startswith(".")} == {
+        "a.py": "OLD_A", "b.py": "OLD_B"}
+    assert not (root / ZIP_SWAP_JOURNAL).exists()
+
+
+@pytest.mark.parametrize("requires", [">=3.8", ">=3.99"])
+def test_the_zip_gate_never_admits_a_conflict_marker_even_for_a_newer_python(tmp_path, monkeypatch, requires):
+    """A release whose requires-python excludes this interpreter skipped the ZIP pre-commit gate
+    entirely, so a startup module with a merge-conflict marker (broken under EVERY Python) was
+    swapped in (review C5). Its syntax may be a newer Python's, the marker never is."""
+    from hermes_cli import update_cmd_commit
+
+    armed = []
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: armed.append(a))
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    (live / "hermes_cli").mkdir(parents=True)
+    (live / "hermes_cli" / "main.py").write_text("OLD = 1\n", encoding="utf-8")
+    (extracted / "hermes_cli").mkdir(parents=True)
+    (extracted / "hermes_cli" / "main.py").write_text(
+        "<<<<<<< HEAD\nA = 1\n=======\nA = 2\n>>>>>>> branch\n", encoding="utf-8")
+    (extracted / "pyproject.toml").write_text(
+        f'[project]\nname = "x"\nrequires-python = "{requires}"\n', encoding="utf-8")
+
+    with pytest.raises(SyntaxError):
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), ["hermes_cli", "pyproject.toml"], live, None)
+
+    assert not armed  # refused before the commit point
+    assert (live / "hermes_cli" / "main.py").read_text(encoding="utf-8") == "OLD = 1\n"

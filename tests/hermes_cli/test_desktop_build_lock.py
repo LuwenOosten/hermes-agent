@@ -238,3 +238,84 @@ def test_update_path_waits_for_a_held_lock(tmp_path, monkeypatch, capsys):
 
     assert release_calls == [True], "update path must acquire the lock in wait mode"
     assert built == [True]
+
+
+
+# --- C5: a direct desktop build and an updater never hold different locks over one checkout ---
+
+_UPDATE_HOLDER = (
+    "import sys, time\n"
+    "from pathlib import Path\n"
+    "from hermes_cli.update_lock import UpdateLock\n"
+    "lock = UpdateLock(path=Path(sys.argv[2]), install_root=Path(sys.argv[1]))\n"
+    "assert lock.acquire()\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def test_a_held_desktop_build_lock_keeps_an_updater_off_the_checkout(tmp_path):
+    """C5: a direct ``hermes desktop`` build holds DesktopBuildLock while npm writes the
+    checkout; an updater (UpdateLock over the same checkout) must be refused meanwhile."""
+    root = _checkout(tmp_path)
+    build = DesktopBuildLock(root)
+    assert build.acquire() is True
+    probe = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from hermes_cli.update_lock import UpdateLock\n"
+        "lock = UpdateLock(path=Path(sys.argv[2]), install_root=Path(sys.argv[1]))\n"
+        "raise SystemExit(23 if not lock.acquire() else 0)\n"
+    )
+    try:
+        result = subprocess.run([sys.executable, "-c", probe, str(root), str(tmp_path / "marker")],
+                                check=False, timeout=60)
+    finally:
+        build.release()
+    assert result.returncode == 23, "an updater took the checkout while a desktop build held it"
+
+
+def test_a_running_update_refuses_a_direct_desktop_build(tmp_path):
+    """C5, the other acquisition order: while an updater holds the checkout, a direct build is
+    refused before it takes the desktop build lock (one lock order: checkout, then build)."""
+    root = _checkout(tmp_path)
+    holder = subprocess.Popen([sys.executable, "-c", _UPDATE_HOLDER, str(root), str(tmp_path / "marker")],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        build = DesktopBuildLock(root)
+        assert build.acquire() is False, "a desktop build started while an updater held the checkout"
+        assert _desktop_lock_free(root), "a refused build kept the desktop build lock"
+    finally:
+        holder.communicate("", timeout=30)
+    assert DesktopBuildLock(root).acquire() is True  # the update released it: the build proceeds
+
+
+def _desktop_lock_free(root: Path) -> bool:
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    if not DesktopBuildLock(root).path.exists():
+        return True
+    with DesktopBuildLock(root).path.open("a+", encoding="utf-8") as handle:
+        free = _try_acquire_file_lock(handle)
+        if free:
+            _release_file_lock(handle)
+    return free
+
+
+def test_the_updates_own_desktop_build_joins_its_checkout_lock(tmp_path):
+    """C5 control: the update path takes DesktopBuildLock while already holding the checkout
+    lock; it joins it (never waits on itself) and its release leaves the update's hold intact."""
+    from hermes_cli import update_lock
+
+    root = _checkout(tmp_path)
+    update = update_lock.UpdateLock(path=tmp_path / "marker", install_root=root)
+    assert update.acquire()
+    try:
+        build = DesktopBuildLock(root)
+        assert build.acquire(wait=True) is True
+        build.release()
+        assert update_lock._HELD is not None and update_lock.checkout_lock_held(root)
+    finally:
+        update.release()
+    assert update_lock._HELD is None

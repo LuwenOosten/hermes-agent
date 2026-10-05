@@ -17,6 +17,11 @@ from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
 import hermes_yaml
 
 
+def _swap_leftovers(root):
+    """Staging/backup siblings and the journal; the swap lock is a stable sidecar that stays (one inode)."""
+    return [p for p in root.glob("*.hermes-update-*") if p.name != ".hermes-update-zip-swap.lock"]
+
+
 @pytest.fixture
 def zip_update(tmp_path, monkeypatch, isolated_source_completion):
     home = tmp_path / "home"
@@ -151,7 +156,7 @@ def test_zip_command_migrates_profiles_recovers_snapshot_and_verifies_fleet(
     assert receipt["runtime_outcomes"][0]["outcome"] == "restarted"
     assert update_receipt._current.get() is None
     assert state.token["resume_needed"] is False
-    assert not list(state.root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(state.root)
 
 
 @pytest.mark.parametrize("verdict", ["healthy", "unsafe-sqlite", "stale-fleet"])
@@ -204,15 +209,16 @@ def test_zip_failure_recovers_pause_without_completion_mutations(zip_update, mon
     monkeypatch.setattr(update_cmd, "_git_run", fail_fetch)
     installed = []
     if failure in {"swap", "late-swap"}:
-        rename = os.rename
-
-        def fail_second_swap(src, dst):
-            if str(src).endswith(".hermes-update-staging"):
-                installed.append(dst)
-                if len(installed) == (5 if failure == "late-swap" else 2):
-                    raise OSError("locked replacement")
-            return rename(src, dst)
-        monkeypatch.setattr(os, "rename", fail_second_swap)
+        def failing_nth_swap(move):  # root files swap by os.replace, directories by os.rename
+            def fail_second_swap(src, dst):
+                if str(src).endswith(".hermes-update-staging"):
+                    installed.append(dst)
+                    if len(installed) == (5 if failure == "late-swap" else 2):
+                        raise OSError("locked replacement")
+                return move(src, dst)
+            return fail_second_swap
+        monkeypatch.setattr(os, "rename", failing_nth_swap(os.rename))
+        monkeypatch.setattr(os, "replace", failing_nth_swap(os.replace))
         expected = SystemExit
     elif failure == "stage":
         import shutil
@@ -239,15 +245,15 @@ def test_zip_failure_recovers_pause_without_completion_mutations(zip_update, mon
         assert (state.root / "pyproject.toml").read_bytes() == old_project
         assert (state.root / "payload.txt").read_text() == "old"
     if failure != "preparation":
-        assert {p.relative_to(state.root): p.read_bytes()
-                for p in state.root.rglob("*") if p.is_file()} == original_tree
+        assert {p.relative_to(state.root): p.read_bytes() for p in state.root.rglob("*")
+                if p.is_file() and p.name != ".hermes-update-zip-swap.lock"} == original_tree
     assert state.events == ["resume"]
     assert state.token["resume_needed"] is False
     assert {profile: (profile / "config.yaml").read_bytes() for profile in before} == before
     assert not (state.sibling / ".env").exists()
     assert json.loads(state.jobs.read_text()) == state.original_jobs
     assert not (state.active / "logs/update_receipts/latest.json").exists()
-    assert not list(state.root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(state.root)
 
 
 @pytest.mark.parametrize("entry", ["payload.txt", "tools"])
@@ -260,8 +266,9 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
     target.rename(backup)
     leftover = root / (entry + ".hermes-update-staging")
     leftover.write_text("interrupted copy", encoding="utf-8")
-    function = "copytree" if entry == "tools" else "copy2"
-    original = getattr(shutil, function)
+    # The file copy is update_cmd_zip's exclusive create (review Z2), no longer shutil.copy2.
+    owner, function = (shutil, "copytree") if entry == "tools" else (update_cmd_zip, "_copy_file_exclusive")
+    original = getattr(owner, function)
 
     def fail(src, dst, *args, **kwargs):
         if str(dst) == str(leftover):
@@ -269,16 +276,16 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
         return original(src, dst, *args, **kwargs)
 
     with monkeypatch.context() as fault:
-        fault.setattr(shutil, function, fail)
+        fault.setattr(owner, function, fail)
         with pytest.raises(SystemExit) as error:
             update_cmd_zip._download_and_swap_zip("main", "local fixture")
         assert error.value.code == 1
     witness = target / "code.py" if entry == "tools" else target
     assert witness.read_text(encoding="utf-8") == ("retained" if entry == "tools" else "old")
-    assert not list(root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(root)
     update_cmd_zip._download_and_swap_zip("main", "local fixture")
     assert witness.read_text(encoding="utf-8") == "new"
-    assert not list(root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(root)
 
 
 def test_atomic_directory_compat_entrypoint(tmp_path):
@@ -290,7 +297,7 @@ def test_atomic_directory_compat_entrypoint(tmp_path):
     update_cmd_zip._atomic_replace_dir(str(src), str(dst))
     assert {p.name for p in dst.iterdir()} == {"new"}
     assert (dst / "new").read_text(encoding="utf-8") == "new"
-    assert not list(tmp_path.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(tmp_path)
 
 
 def test_zip_refuses_non_main_before_transport(zip_update, monkeypatch, capsys):
@@ -337,3 +344,28 @@ def test_installed_app_without_a_checkout_build_is_still_rebuilt(zip_update, mon
     update_cmd._cmd_update_impl(SimpleNamespace(branch="main", yes=True), False)
 
     assert built == [rebuilt]
+
+
+def test_unpinned_zip_update_owes_the_restart_for_the_archive_commit(tmp_path, monkeypatch):
+    """A branch ZIP (no target SHA) still names its commit: GitHub archives carry it as the ZIP comment
+    (``git archive``). The restart debt and the completion are armed for that commit, never for ''."""
+    from hermes_cli import update_cmd_commit
+
+    sha = "8192da90e0afb20010a1c2f5da83db305d05ac5a"
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "payload.txt").write_text("old", encoding="utf-8")
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as out:
+        out.writestr("hermes-agent-main/payload.txt", "new")
+        out.comment = sha.encode()
+    monkeypatch.setattr("urllib.request.urlretrieve", lambda url, dst: urlretrieve(archive.as_uri(), dst))
+    monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(update_cmd_zip, "_abort_zip_update_if_dirty_tree", lambda: None)
+    armed, completed = [], []
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda _root, expected: armed.append(expected))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(dict(request)))
+    update_cmd_zip._update_via_zip(SimpleNamespace(branch="main"), completion_request={})
+    assert (root / "payload.txt").read_text(encoding="utf-8-sig") == "new"
+    assert armed == [sha]
+    assert [request["expected_sha"] for request in completed] == [sha]

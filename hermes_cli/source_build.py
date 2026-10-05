@@ -46,16 +46,25 @@ def source_build_env(base_env: dict | None = None, *, explicit: bool = False) ->
     return ensure("npm", base_env=env, explicit=explicit).env
 
 
-def run_source_script(project_root: Path, script: str, *args: str, env: dict, label: str) -> None:
+def run_in_custody(project_root: Path, command: list, label: str, **kwargs):
+    """``pm.progress.run_contained`` for a build command that writes the checkout (node, npm):
+    it and everything it starts stay in the update's custody (POSIX: the checkout lock fd, the
+    caller's process group, and every descendant killed when it exits; Windows: the owner's
+    kill-on-close job), so the checkout is never handed to a contender while one of them still
+    writes. Outside an update it is ``run_contained`` as is."""
     from pm.progress import run_contained
+    from hermes_cli.update_custody import contained_command
 
+    with contained_command(command, root=project_root) as (argv, custody):
+        return run_contained(argv, label, **kwargs, **custody)
+
+
+def run_source_script(project_root: Path, script: str, *args: str, env: dict, label: str) -> None:
+    command = [shutil.which("node", path=env["PATH"]), str(project_root / script), *args]
     # npm's deprecation warnings are the loudest lines and never actionable
     # here; they still land in the failure tail.
-    run_contained(
-        [shutil.which("node", path=env["PATH"]), str(project_root / script), *args],
-        label, hide=lambda line: line.lower().startswith("npm warn"), indent="  ",
-        cwd=project_root, env=env,
-    )
+    run_in_custody(project_root, command, label, hide=lambda line: line.lower().startswith("npm warn"),
+                   indent="  ", cwd=project_root, env=env)
 
 
 def prepare_source_dependencies(project_root: Path, workspaces: tuple[str, ...], *, env: dict,

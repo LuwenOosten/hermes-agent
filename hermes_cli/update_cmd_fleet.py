@@ -82,8 +82,8 @@ def _write_legacy_fleet_restart_pending_marker(
         return False
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> None:
-    """Arm the HOST pull→restart obligation. Never raises.
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None, owner: str = "") -> bool:
+    """Arm the HOST pull→restart obligation. Never raises; False when neither store took it.
 
     An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
     UID that does not own ``$HOME``) must never disarm the obligation: an update interrupted
@@ -95,20 +95,20 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         # An explicit empty inventory owes no restart (e.g. Desktop-hosted `serve` with no
         # gateway services). Arming the marker here leaves a breadcrumb nothing can discharge:
         # a no-gateway host would then fail every later ``hermes update`` (#115311).
-        return
+        return True
     from hermes_cli.update_cmd import _m
     from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
     if _m()._pytest_owns_live_checkout(_fleet_restart_pending_marker_path().parent):
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
-        return
+        return True
     if write_host_obligation(
-            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name()):
-        return
+            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name(), owner=owner):
+        return True
     if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes):
         logger.warning(
             "Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
             host_obligation_path(), _fleet_restart_pending_marker_path())
-        return
+        return True
     logger.error(
         "Could not arm the update-restart obligation in %s or %s; an interrupted update will not warn.",
         host_obligation_path(), _fleet_restart_pending_marker_path())
@@ -117,6 +117,7 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         "restart gateways with `hermes gateway restart` if this update is interrupted.",
         file=sys.stderr,
     )
+    return False
 
 
 def _current_profile_name() -> str:
@@ -717,51 +718,13 @@ def _systemctl(cmd: list, *, timeout: float):
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
-# poll() takes signed 32-bit milliseconds; keep headroom for rounding in communicate().
-_SYSTEMCTL_RESTART_TIMEOUT_MAX = (2**31 - 1) // 1000 - 1
-
-
-def _systemd_restart_timeout(scope_cmd: list, svc_name: str, *, start_only: bool = False) -> float:
-    """Outwait the unit's stop + start budgets, not just the systemctl client.
-
-    A client timeout does not cancel the manager's queued restart. Unknown or
-    infinite limits use systemd's usual 90s per phase so automation stays bounded.
-    Custom ExecStop chains or EXTEND_TIMEOUT_USEC can still exceed this budget;
-    genuine timeouts must continue through the existing per-unit failure path.
-    """
-    from gateway.shutdown_forensics import parse_systemd_duration_to_us
-
-    budgets = {"TimeoutStartUSec": 90.0}
-    if not start_only:
-        budgets["TimeoutStopUSec"] = 90.0
-    try:
-        show = _systemctl(
-            scope_cmd + ["show", svc_name, "--property=TimeoutStopUSec,TimeoutStartUSec"],
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return sum(budgets.values()) + 15.0
-    if show.returncode == 0:
-        for line in (show.stdout or "").splitlines():
-            key, _, raw = line.partition("=")
-            if key in budgets:
-                # The shared parser returns None for infinity/unrecognized units.
-                try:
-                    raw = raw.strip()
-                    duration = int(raw) if raw.isascii() and raw.isdigit() else parse_systemd_duration_to_us(raw)
-                    if duration is not None and duration > 0:
-                        budgets[key] = duration / 1_000_000
-                except (ValueError, OverflowError):
-                    pass
-    return min(sum(budgets.values()) + 15.0, _SYSTEMCTL_RESTART_TIMEOUT_MAX)
-
-
 def _systemctl_reset_and_restart(manage_cmd: list, svc_name: str, *, scope_cmd: list | None = None):
     """``reset-failed`` then ``restart``: a unit parked in failed state by systemd's own
     auto-restart can wedge a plain ``restart`` against RestartSec backoff and stay dead."""
     # Property reads need no manage-units privileges: narrow sudoers may permit
     # restart/reset-failed but deny show. Keep the same user/system manager scope.
-    timeout = _systemd_restart_timeout(scope_cmd if scope_cmd is not None else manage_cmd, svc_name)
+    from hermes_cli.update_cmd_fleet_unit_budget import systemd_restart_timeout
+    timeout = systemd_restart_timeout(scope_cmd if scope_cmd is not None else manage_cmd, svc_name)
     _systemctl(manage_cmd + ["reset-failed", svc_name], timeout=10)
     return _systemctl(manage_cmd + ["restart", svc_name], timeout=timeout)
 
@@ -1317,6 +1280,7 @@ def _restart_one_systemd_gateway_unit(
         _main_pid, drain_budget, svc_name, self_restart_pending=self_restart_pending)
 
     if _graceful_ok:
+        from hermes_cli.update_cmd_fleet_unit_budget import service_restart_sec, systemd_restart_timeout
         # ``Restart=always`` respawns only after RestartSec (60s in our unit; dead time for a
         # voluntary restart). ``reset-failed`` + ``start`` skips it (~1-3s); if RestartSec already
         # elapsed, ``start`` is a no-op and we fall through to the poll. Needs manage-units
@@ -1325,14 +1289,14 @@ def _restart_one_systemd_gateway_unit(
             _systemctl(_manage_cmd + ["reset-failed", svc_name], timeout=10)
             _systemctl(
                 _manage_cmd + ["start", svc_name],
-                timeout=_systemd_restart_timeout(scope_cmd, svc_name, start_only=True),
+                timeout=systemd_restart_timeout(scope_cmd, svc_name, start_only=True),
             )
             if _wait_for_service_active(scope_cmd, svc_name, timeout=10.0):
                 restarted_services.append(svc_name)
                 return
         # Passive poll: auto-restart fires after RestartSec regardless of
         # privileges — primary when _manage_cmd is None, fallback otherwise.
-        _restart_sec = _service_restart_sec(scope_cmd, svc_name, default=0.0)
+        _restart_sec = service_restart_sec(scope_cmd, svc_name, default=0.0)
         if _manage_cmd is None and _restart_sec > 5.0:
             print(
                 f"  → {svc_name}: waiting for systemd "
@@ -2137,29 +2101,3 @@ def _wait_for_service_active(scope_cmd_: list, svc_name_: str, timeout: float = 
         if _time.monotonic() >= deadline:
             return False
         _time.sleep(0.5)
-
-
-_RESTART_SEC_UNITS = (("ms", 0.001), ("us", 0.000001), ("min", 60.0), ("s", 1.0))
-
-
-def _service_restart_sec(scope_cmd_: list, svc_name_: str, default: float = 0.0) -> float:
-    """Read the unit's ``RestartUSec`` in seconds. ``is-active`` pollers must wait
-    >= RestartSec + slack or they give up *during* the cooldown and misreport."""
-    try:
-        _show = _systemctl(scope_cmd_ + ["show", svc_name_, "--property=RestartUSec", "--value"], timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return default
-    raw = (_show.stdout or "").strip()
-    # Values like "30s", "100ms", "1min 30s", "infinity"; on any miss return default.
-    if not raw or raw == "infinity":
-        return default
-    total = 0.0
-    matched = False
-    for part in raw.split():
-        for _suf, _mult in _RESTART_SEC_UNITS:
-            if part.endswith(_suf):
-                with suppress(ValueError):
-                    total += float(part[: -len(_suf)]) * _mult
-                    matched = True
-                break
-    return total if matched else default
