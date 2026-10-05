@@ -257,6 +257,23 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   return backend
 }
 
+// Some platforms expose no way to read another process's environment or cwd, so a
+// module-launched backend there can never name its tree in argv (Windows: the venv
+// launcher hands the interpreter over as a system python). When the listener is a
+// descendant of the app, and the caller has already asserted the root that app
+// reported resolving, those two facts together are the evidence. A ledger-registered
+// host backend is not tied to this app by ancestry, so the app's report says nothing
+// about it; it must carry its own argv/env/cwd evidence. Requiring the process
+// evidence to be absent keeps this from loosening a platform that can read one.
+function appVouchesForBackend(backend: NativeProcess, evidence: OriginEvidence,
+  sameTree: (value?: string) => boolean): boolean {
+  const processEvidenceUnreadable = backend.cwd === undefined
+    && backend.pythonPath === undefined && backend.virtualEnv === undefined
+
+  return processEvidenceUnreadable && backend.ownership !== 'host-ledger'
+    && evidence.appReportedRoot !== undefined && sameTree(evidence.appReportedRoot)
+}
+
 export function assertBackendOrigin(backend: NativeProcess, root: string, origin: 'source' | 'bundled',
   evidence: OriginEvidence = {}): void {
   if (origin === 'bundled') {
@@ -323,19 +340,7 @@ export function assertBackendOrigin(backend: NativeProcess, root: string, origin
       || (backend.virtualEnv !== undefined && backend.virtualEnv.trim() !== ''
           && sameTree(path.dirname(backend.virtualEnv)))
 
-    // Some platforms expose no way to read another process's environment or cwd, so a
-    // module-launched backend there can never name its tree in argv (Windows: the venv
-    // launcher hands the interpreter over as a system python). When the listener is a
-    // descendant of the app, and the caller has already asserted the root that app
-    // reported resolving, those two facts together are the evidence. A ledger-registered
-    // host backend is not tied to this app by ancestry, so the app's report says nothing
-    // about it; it must carry its own argv/env/cwd evidence. Requiring the process
-    // evidence to be absent keeps this from loosening a platform that can read one.
-    const processEvidenceUnreadable = backend.cwd === undefined
-      && backend.pythonPath === undefined && backend.virtualEnv === undefined
-
-    const appOwnsBackend = processEvidenceUnreadable && backend.ownership !== 'host-ledger'
-      && evidence.appReportedRoot !== undefined && sameTree(evidence.appReportedRoot)
+    const appOwnsBackend = appVouchesForBackend(backend, evidence, sameTree)
 
     if (!sameTree(backend.cwd) && !namesInstallRoot && !usesInstallEnvironment && !appOwnsBackend) {
       throw new Error('Source backend listener imports a different source tree'
