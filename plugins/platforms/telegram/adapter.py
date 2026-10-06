@@ -3029,10 +3029,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
-        # One platform-trust SSL context shared by every client/transport below. httpx builds a
-        # fresh context per client, and with truststore that synchronous construction can block
-        # in the OS trust store — on the event loop it froze the gateway past the connect
-        # deadline on every reconnect attempt. shared_ssl_context() builds it off-loop, once.
+        # Share the platform-trust context; build it off-loop so TLS loading cannot freeze connect deadlines.
         ssl_context = await shared_ssl_context()
         # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
         request_kwargs = {
@@ -3045,13 +3042,9 @@ class TelegramAdapter(BasePlatformAdapter):
             # tolerance, not bandwidth), so 60s rides out congested-link buffer stalls.
             "media_write_timeout": 60.0,
         }
-        # CLOSE_WAIT fd leak: PTB's httpx.AsyncClient has no keepalive tuning; inject platform_httpx_limits()
-        # while preserving PTB's max_connections (httpx_kwargs is spread last, so `limits` here wins).
-        # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's HTTPXRequest builds the underlying
-        # httpx.AsyncClient with `limits = httpx.Limits(max_connections=connection_pool_size)` and *no*
-        # keepalive tuning, so httpx's default keepalive_expiry=5.0 applies. Behind an HTTP proxy
-        # (Cloudflare Warp etc.) a peer-initiated FIN can sit in CLOSE_WAIT longer than that, leaking fds in
-        # the general request pool (_request[1]) which _drain_polling_connections never resets.
+        # CLOSE_WAIT leaks (#31599, #18451): proxy peer FINs can linger in the general request
+        # pool, which _drain_polling_connections never resets. Tune keepalive while preserving
+        # PTB max_connections; httpx_kwargs is spread last, so these limits take precedence.
         from gateway.platforms._http_client_limits import platform_httpx_limits
         _base_limits = platform_httpx_limits()
         if _base_limits is not None:
@@ -3100,7 +3093,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if fallback_ips and not proxy_url and not disable_fallback:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
-            # Separate request/update pools reduce contention during polling reconnect + bootstrap calls.
             _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options(), "verify": ssl_context}
             # Keep request/update pools separate to reduce contention during polling reconnect + bot API
             # bootstrap/delete_webhook calls. httpx ignores the client-level `limits` kwarg when a custom

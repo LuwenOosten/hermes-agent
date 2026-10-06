@@ -4,6 +4,7 @@ api.telegram.org while TCP retries known IPv4 literals) plus DoH-based IP discov
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import logging
 import socket
@@ -19,9 +20,19 @@ _TELEGRAM_API_HOST = "api.telegram.org"
 
 # Local mirror of platform_ssl_context()'s process-wide context. platform_ssl_context()
 # already caches its own context, but the local reference exists so the warm path can
-# return without an asyncio.to_thread hop; cold initialization stays off the event loop
-# (via shared_ssl_context).
+# return without touching the initialization Future or a thread hop; cold initialization
+# stays off the event loop (via shared_ssl_context).
 _SSL_CONTEXT: Optional[ssl.SSLContext] = None
+
+# ONE process-wide initialization, independent of any event loop. Every cold caller in
+# every loop joins this in-flight native Future instead of submitting its own executor
+# work, so cancelled/timed-out callers can never park default-executor workers (which
+# starved unrelated asyncio.to_thread calls under repeated reconnect timeouts).
+_SSL_CONTEXT_FUTURE: Optional[concurrent.futures.Future] = None
+
+# Admission-only lock: held across the Future check/publish and the worker start, never
+# across platform_ssl_context() or any waiting. The single worker is exclusive, so the
+# sync builder below takes no lock of its own.
 _SSL_CONTEXT_LOCK = threading.Lock()
 
 
@@ -29,18 +40,58 @@ def _shared_ssl_context_sync() -> ssl.SSLContext:
     """Build (once per process) the platform-trust context used by every Telegram client.
 
     truststore's first load can block for seconds inside the OS trust store, so
-    event-loop callers must reach this through :func:`shared_ssl_context`.
+    event-loop callers reach this through the shared worker in :func:`shared_ssl_context`.
     """
     global _SSL_CONTEXT
-    ctx = _SSL_CONTEXT
-    if ctx is not None:
-        return ctx
-    with _SSL_CONTEXT_LOCK:
-        if _SSL_CONTEXT is None:
-            from agent.ssl_verify import platform_ssl_context
+    from agent.ssl_verify import platform_ssl_context
 
-            _SSL_CONTEXT = platform_ssl_context()
-        return _SSL_CONTEXT
+    _SSL_CONTEXT = platform_ssl_context()
+    return _SSL_CONTEXT
+
+
+def _initialize_shared_ssl_context(future: concurrent.futures.Future) -> None:
+    """Resolve *future* with the shared context, turning a failure into a waiter result.
+
+    Runs on the context-bound daemon worker. An exception escaping here would both leave
+    every waiter hanging and print from a daemon thread, so it is delivered through the
+    Future; the failed Future is then replaced to let a later cold call retry.
+    """
+    try:
+        ctx = _shared_ssl_context_sync()
+    except BaseException as exc:  # health: allow BLE001 -- the Future hands the failure to waiters
+        future.set_exception(exc)
+    else:
+        future.set_result(ctx)
+
+
+def _shared_ssl_context_future() -> concurrent.futures.Future:
+    """The process-wide initialization Future, started by the first cold caller.
+
+    A failed initialization is replaced so the next caller retries; a successful one is
+    returned forever. The native Future is marked RUNNING before it is published, because
+    cancelling an asyncio wrapper around it also cancels the native source — one cancelled
+    caller must not strand the build every other waiter is still waiting on.
+    """
+    global _SSL_CONTEXT_FUTURE
+    with _SSL_CONTEXT_LOCK:
+        future = _SSL_CONTEXT_FUTURE
+        if future is not None:
+            if not future.done():
+                return future
+            if future.exception() is None:
+                return future
+            _SSL_CONTEXT_FUTURE = None
+        from agent.memory_provider import spawn_context_thread
+
+        future = concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
+        # Publish only after start: if the OS refuses the thread, no caller ever sees a
+        # Future nobody will resolve, and the next call starts a fresh attempt.
+        spawn_context_thread(
+            _initialize_shared_ssl_context, args=(future,), name="telegram-ssl-context", daemon=True,
+        ).start()
+        _SSL_CONTEXT_FUTURE = future
+        return future
 
 
 async def shared_ssl_context() -> ssl.SSLContext:
@@ -51,11 +102,21 @@ async def shared_ssl_context() -> ssl.SSLContext:
     stalls, constructing clients on the event loop freezes the whole gateway —
     including the connect deadline's own expiry callback — so reconnect
     attempts time out even though the network path is fine.
+
+    All callers share one daemon-worker build. Cancelling a caller only cancels that
+    caller's wrapper (the native Future is uncancellable while it runs), so a cancelled
+    or timed-out waiter never stalls or duplicates the process-wide initialization; the
+    next cold call joins the same in-flight Future, whatever loop the previous one ran on.
     """
     ctx = _SSL_CONTEXT
     if ctx is not None:
         return ctx
-    return await asyncio.to_thread(_shared_ssl_context_sync)
+    wrapped = asyncio.wrap_future(_shared_ssl_context_future())
+    # Mark a failure retrieved even when this caller was cancelled in the same tick: the
+    # shared build's exception belongs to the waiters that remain, and an abandoned wrapper
+    # must not surface as an unhandled-future report on the loop.
+    wrapped.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await wrapped
 
 
 def _describe_transport_error(error: Exception) -> str:

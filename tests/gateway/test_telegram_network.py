@@ -395,7 +395,25 @@ class TestSharedSslContext:
 
     @pytest.fixture(autouse=True)
     def _reset_cached_context(self, monkeypatch):
+        """Fresh cold start per test; every worker started here is joined before the
+        monkeypatch restoration so a late build can never write into the next test."""
+        from agent import memory_provider
+
+        workers: list = []
+        real_spawn = memory_provider.spawn_context_thread
+
+        def _record_worker(*args, **kwargs):
+            thread = real_spawn(*args, **kwargs)
+            workers.append(thread)
+            return thread
+
+        monkeypatch.setattr(memory_provider, "spawn_context_thread", _record_worker)
         monkeypatch.setattr(tnet, "_SSL_CONTEXT", None)
+        monkeypatch.setattr(tnet, "_SSL_CONTEXT_FUTURE", None)
+        yield
+        for worker in workers:
+            worker.join(timeout=5.0)
+        assert not any(worker.is_alive() for worker in workers), "a shared-context worker outlived its test"
 
     @pytest.mark.asyncio
     async def test_first_build_is_off_loop_and_loop_keeps_running(self, monkeypatch):
@@ -627,9 +645,8 @@ class TestDiscoverFallbackIps:
         monkeypatch.setattr(tnet.httpx, "AsyncClient", _stalled_async_client_factory)
         monkeypatch.setattr(tnet.socket, "getaddrinfo", lambda *a, **kw: [])
         # The shared context is exercised by TestSharedSslContext; keep this test on
-        # the construction seam only. ``raising=False`` keeps the base-revision red
-        # run failing on the construction-thread assertion, not an AttributeError.
-        monkeypatch.setattr(tnet, "_SSL_CONTEXT", object(), raising=False)
+        # the construction seam only.
+        monkeypatch.setattr(tnet, "_SSL_CONTEXT", object())
 
         task = asyncio.ensure_future(tnet.discover_fallback_ips())
         try:
